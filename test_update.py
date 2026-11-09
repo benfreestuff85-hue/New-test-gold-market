@@ -1,12 +1,17 @@
 import asyncio
 import os
+import warnings
+warnings.filterwarnings('ignore',category=ResourceWarning)   # in-memory test DBs are never closed
+os.environ['FORECAST_DB']=':memory:'
 import time
 import unittest
 from datetime import datetime,timezone
 from decimal import Decimal as D
 from types import SimpleNamespace
 from unittest.mock import AsyncMock,patch
-from free_gold import GoldMonitor,gauge
+import free_gold
+from free_gold import GoldMonitor,gauge,realized_vol,price_at,expiry
+from forecast_log import ForecastLog
 from trade_controls import Execution
 
 T='KXGOLD15M-26NOV09-A';H='KXGOLDH-26NOV09-B'
@@ -22,6 +27,28 @@ def order(n):return dict(order_id='mock-order',fill_count=str(n),remaining_count
 def bot_stub():
     return SimpleNamespace(ENABLE_LIVE_ORDERS=True,KALSHI_KEY_ID='mock',PRIVATE_KEY_OBJ=object(),
         KALSHI_API_PREFIX='/trade-api/v2',KALSHI_HOST='https://mock.invalid',MONITOR=SimpleNamespace(fresh=lambda:True))
+
+def candles(closes,end,tf=60):
+    """Completed candles; the last one ends at `end`."""
+    n=len(closes);out=[];prev=closes[0]
+    for i,c in enumerate(closes):
+        out.append(dict(timestamp=end-tf*(n-i),open=prev,high=max(prev,c),low=min(prev,c),close=c));prev=c
+    return out
+
+class FakeResp:
+    def __init__(s,data,status=200):s.data=data;s.status=status
+    async def json(s):return s.data
+    def raise_for_status(s):
+        if s.status>=400:raise RuntimeError(s.status)
+    async def __aenter__(s):return s
+    async def __aexit__(s,*a):return False
+class FakeSession:
+    def __init__(s,routes):s.routes=routes;s.calls=[]
+    def get(s,url,**kw):
+        s.calls.append(url)
+        for key,data in s.routes.items():
+            if key in url:return FakeResp(data)
+        return FakeResp({},404)
 
 class TradeTests(unittest.IsolatedAsyncioTestCase):
     def execution(self,responses):
@@ -173,15 +200,62 @@ class SelectorTests(unittest.IsolatedAsyncioTestCase):
 
 class ForecastTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_forecast_per_timeframe(self):
-        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time();g.model=lambda state,minutes:(63,.00001,.001)
-        markets=[market()]
+        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time()
+        g.model=lambda state,minutes:dict(sigma=.0003 if minutes==15 else .0004,momentum=63 if minutes==15 else -20,fallback=False)
+        markets=[market()];close=stamp(1800)      # one shared expiry string, as on a real hourly ladder
         for i in range(20):
-            m=market(H+str(i));m.update(series_ticker='KXGOLDH',floor_strike=3900+10*i,expiration_time=stamp(1800));markets.append(m)
+            m=market(H+str(i));m.update(series_ticker='KXGOLDH',floor_strike=3900+10*i,expiration_time=close,close_time=close);markets.append(m)
         b=SimpleNamespace(STATE=SimpleNamespace(active_markets_count=0),fetch_kalshi_gold_markets=AsyncMock(return_value=markets),
             fetch_orderbook_details=AsyncMock(return_value={'yes_ask':45,'no_ask':58,'spread':3}),parse_strike=lambda m:float(m['floor_strike']))
-        await g.refresh(None,b);self.assertEqual(len(g.rows),2);self.assertIsNone(g.rows[1]['yes_score'])
-        report=g.report();self.assertEqual(report.count('Projected finish:'),2)
-        hour=report.split('<b>1-HOUR MARKET</b>')[1].split('<i>')[0];self.assertNotIn('Model prediction:',hour)
+        await g.refresh(None,b);self.assertEqual(len(g.rows),2)
+        hour=g.rows[1];self.assertEqual(hour['target'],4000.0)          # nearest hourly strike to spot, never the whole ladder
+        self.assertIsNotNone(hour['yes_score']);self.assertIn(hour['prediction'],('YES','NO'))
+        self.assertNotEqual(g.rows[0]['sigma_usd'],hour['sigma_usd'])    # own vol window and time left
+        report=g.report();self.assertEqual(report.count('Model prediction:'),2);self.assertEqual(report.count('Typical move to finish'),2)
+        self.assertNotIn('Projected finish',report)
+
+    async def test_probability_zero_drift_and_clamped(self):
+        g=GoldMonitor()
+        self.assertAlmostEqual(g.probability(4000,4000,'greater',600,.0003),.5,delta=.01)
+        near=g.probability(4001,4000,'greater',60,.0003);far=g.probability(4001,4000,'greater',600,.0003)
+        self.assertGreater(near,far);self.assertGreater(far,.5)
+        self.assertAlmostEqual(g.probability(4003,4000,'less',300,.0003),1-g.probability(4003,4000,'greater',300,.0003),places=6)
+        self.assertEqual(g.probability(4100,4000,'greater',60,.0003),free_gold.P_MAX)
+        self.assertEqual(g.probability(3900,4000,'greater',60,.0003),free_gold.P_MIN)
+    async def test_basis_uncertainty_limits_confidence(self):
+        g=GoldMonitor()
+        with patch.object(free_gold,'BASIS_USD',0.01):tight=g.probability(4001,4000,'greater',30,.0001)
+        with patch.object(free_gold,'BASIS_USD',2.0):loose=g.probability(4001,4000,'greater',30,.0001)
+        self.assertGreater(tight,loose)
+    async def test_trend_does_not_move_probability(self):
+        g=GoldMonitor();now=time.time();g.publish_time=g.received=now-1;e=int(g.publish_time//60)*60
+        closes=[3990+i*.15 for i in range(70)];g.price=closes[-1]
+        st=SimpleNamespace(candles_1m=SimpleNamespace(candles=candles(closes,e)),candles_5m=SimpleNamespace(candles=[]))
+        m=g.model(st,15);self.assertGreater(m['momentum'],50)          # strong uptrend shows on the gauge ...
+        p=g.probability(g.price,g.price,'greater',600,m['sigma'])
+        self.assertAlmostEqual(p,.5,delta=.02)                         # ... but never biases the probability
+    async def test_vol_close_to_close_and_gap_tolerant(self):
+        closes=[4000*(1+.0002*(-1)**i) for i in range(40)]
+        c=candles(closes,1_800_000_000);self.assertAlmostEqual(realized_vol(c,60,60,20),.0004,delta=.0001)
+        gap=c[:20]+c[21:];self.assertIsNotNone(realized_vol(gap,60,60,20))   # one missing minute no longer blanks the model
+    async def test_gap_does_not_blank_model_or_hourly_lookback_warmup(self):
+        g=GoldMonitor();now=time.time();g.publish_time=g.received=now-1;e=int(g.publish_time//60)*60
+        closes=[4000+(i%5)*.3 for i in range(70)];cs=candles(closes,e);del cs[30]
+        g.price=closes[-1];st=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs),candles_5m=SimpleNamespace(candles=[]))
+        m15=g.model(st,15);self.assertIsNotNone(m15);self.assertIsNotNone(m15['momentum'])
+        short=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs[-30:]),candles_5m=SimpleNamespace(candles=[]))
+        self.assertIsNotNone(g.model(short,15)['momentum']);self.assertIsNone(g.model(short,60)['momentum'])  # no fake 1h gauge from 30 min
+        self.assertTrue(g.model(st,60)['fallback'])
+    async def test_expiry_prefers_close_time_over_latest_expiration(self):
+        m=market();m['expiration_time']=stamp(6*3600);m.pop('expected_expiration_time',None)
+        self.assertLess(expiry(m)-time.time(),700)
+    async def test_implausible_expiry_withheld(self):
+        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time()
+        g.model=lambda state,minutes:dict(sigma=.0003,momentum=0,fallback=False)
+        m=market();m['close_time']=m['expiration_time']=stamp(5*3600)
+        b=SimpleNamespace(STATE=SimpleNamespace(active_markets_count=0),fetch_kalshi_gold_markets=AsyncMock(return_value=[m]),
+            fetch_orderbook_details=AsyncMock(return_value=None),parse_strike=lambda m:4000.)
+        await g.refresh(None,b);self.assertIsNone(g.rows[0]['yes_score']);self.assertIn('implausible',g.rows[0]['reason'])
     async def test_positive_gauge(self):self.assertIn('░'*8+'│'+'█'*5,gauge(63))
     async def test_negative_gauge(self):self.assertIn('░'*3+'█'*5+'│'+'░'*8,gauge(-63))
     async def test_stale_feed(self):
@@ -191,6 +265,73 @@ class ForecastTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_symbol(self):
         with self.assertRaises(ValueError):GoldMonitor().decode(dict(symbol='XAG',price=4000,updatedAt=stamp(0)))
     async def test_nan_threshold(self):self.assertIn('Usage',GoldMonitor().command('threshold nan'))
+
+class LogTests(unittest.IsolatedAsyncioTestCase):
+    def row(self,ticker,minutes=15,p=70.,left=300,bid=60,ask=64):
+        return dict(minutes=minutes,ticker=ticker,target=4000.,yes_score=p,seconds_left=left,momentum=10,quotes=dict(yes_bid=bid,yes_ask=ask))
+    def mk(self,ticker,end,**kw):
+        return dict(ticker=ticker,strike_type='greater',close_time=stamp(0),expected_expiration_time=stamp(0),expiration_time=stamp(0))
+    async def test_settle_records_official_result_value_and_proxy_basis(self):
+        g=GoldMonitor();end=int(time.time()//60)*60-120
+        g.log.record(self.mk('KXGOLD15M-X',end),self.row('KXGOLD15M-X'),.0003,4001.,2.,time.time()-400,end)
+        # candle ENDING at `end` (timestamp end-60) closes 4001.00; candle ending at end-900 closes 3999.50
+        cs=[dict(timestamp=end-960,open=1,high=1,low=1,close=3999.5),dict(timestamp=end-60,open=1,high=1,low=1,close=4001.0)]
+        bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2',STATE=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs)))
+        sess=FakeSession({'/markets/KXGOLD15M-X':{'market':dict(result='yes',expiration_value='4000.40',floor_strike=3999.9)}})
+        await g.settle(sess,bot)
+        row=g.log.db.execute('SELECT result,expiration_value,settle_strike,proxy_start,proxy_end FROM markets').fetchone()
+        self.assertEqual(row,('yes',4000.4,3999.9,3999.5,4001.0))
+        await g.settle(sess,bot);self.assertEqual(len(sess.calls),1)           # settled markets are not polled again
+        text=g.log.calibration();self.assertIn('+0.60',text);self.assertIn('wrong side of the strike vs official result: 0/1',text)
+    async def test_unpublished_result_stays_pending(self):
+        g=GoldMonitor();end=int(time.time())-120
+        g.log.record(self.mk('KXGOLD15M-Y',end),self.row('KXGOLD15M-Y'),.0003,4001.,2.,time.time()-400,end)
+        bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2',STATE=SimpleNamespace(candles_1m=SimpleNamespace(candles=[])))
+        await g.settle(FakeSession({'/markets/KXGOLD15M-Y':{'market':dict(result='',status='closed')}}),bot)
+        self.assertEqual(len(g.log.pending(time.time())),1)
+    async def test_calibration_brier_vs_kalshi_mid(self):
+        log=ForecastLog(':memory:');now=time.time()
+        for i in range(40):
+            t=f'KXGOLD15M-{i}';end=now-1000-i*900;y='yes' if i%2==0 else 'no'
+            log.record(self.mk(t,end),self.row(t,p=80.,left=300,bid=58,ask=62),.0003,4000.,1.,end-300,end)
+            log.settle(t,y,4000.,4000.,None,None,now)
+        text=log.calibration()
+        self.assertIn('n=40 model 0.340',text)                 # mean((0.8-y)^2)=(0.04+0.64)/2
+        self.assertIn('Kalshi mid 0.260',text)                 # mean((0.6-y)^2)=(0.16+0.36)/2
+    async def test_rows_without_probability_not_logged_and_throttled(self):
+        log=ForecastLog(':memory:');now=time.time();end=now+300
+        log.record(self.mk('T',end),dict(self.row('T'),yes_score=None),.0003,4000.,1.,now,end)
+        log.record(self.mk('T',end),self.row('T'),.0003,4000.,1.,now,end);log.record(self.mk('T',end),self.row('T'),.0003,4000.,1.,now+5,end)
+        self.assertEqual(log.db.execute('SELECT COUNT(*) FROM forecasts').fetchone()[0],1)
+        self.assertIn('ticker,',log.export_csv().splitlines()[0])
+    async def test_log_failure_never_raises(self):
+        log=ForecastLog('/nonexistent-dir/x.db');log.record(self.mk('T',1),self.row('T'),.0003,4000.,1.,1.,1.)
+        self.assertEqual(log.pending(time.time()),[]);self.assertIn('unavailable',log.calibration())
+    async def test_series_terms_and_fee_multiplier(self):
+        g=GoldMonitor();bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2')
+        info={'series':dict(title='Gold 15m',settlement_sources=[dict(name='Pyth',url='u')],contract_terms_url='t',fee_type='quadratic',fee_multiplier=.5)}
+        await g.load_series(FakeSession({'/series/':info}),bot)
+        self.assertAlmostEqual(bot.FEE_RATE,.035);self.assertIn('Pyth',g.command('source'))
+    async def test_series_failure_does_not_break_refresh(self):
+        g=GoldMonitor();await g.load_series(FakeSession({}),SimpleNamespace(KALSHI_BASE_URL='https://x'))
+        self.assertIn('KXGOLD15M: 404',g.command('source'));self.assertGreater(time.time()-g.series_loaded,5.9*3600)  # retry soon, not in 6 h
+
+class AlertTests(unittest.IsolatedAsyncioTestCase):
+    def setup(self,left,momentum=0):
+        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time();g.send_prediction=AsyncMock();g.min_seconds={15:210,60:600}
+        g.rows=[dict(minutes=15,ticker=T,prediction='YES',yes_score=90.,target=4000.,seconds_left=left,momentum=momentum,quotes=dict(yes_ask=50,no_ask=52,spread=3)),
+                dict(minutes=60,ticker=H,prediction=None,yes_score=None,target=None,seconds_left=1800,momentum=momentum,quotes=None)]
+        b=SimpleNamespace(MAX_SPREAD_CENTS=12,MIN_NET_EDGE_CENTS=6,ALERT_COOLDOWN_SECONDS=300,kalshi_taker_fee_cents=lambda a:1.75,
+            detect_reversal_signal=lambda cb,label:dict(direction='BULLISH'),STATE=SimpleNamespace(candles_1m=None,candles_5m=None,tracker=SimpleNamespace(log_signal=lambda *a:None)))
+        return g,b
+    async def test_reversal_alert_fires_with_time_left(self):
+        g,b=self.setup(400);await g.maybe_alert(None,b);g.send_prediction.assert_awaited_once()
+    async def test_no_alert_in_final_minutes(self):
+        g,b=self.setup(100);await g.maybe_alert(None,b);g.send_prediction.assert_not_awaited()
+    async def test_momentum_alerts_off_by_default(self):
+        g,b=self.setup(100,momentum=95);await g.maybe_alert(None,b);g.send_prediction.assert_not_awaited()
+        with patch.object(free_gold,'MOMENTUM_ALERTS',True):await g.maybe_alert(None,b)
+        g.send_prediction.assert_awaited_once()
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def test_sell_http_local_mock(self):
@@ -228,6 +369,18 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                     headers={'Authorization':'Bearer test-secret'}
                     async with session.get(server.make_url('/api/gold'),headers=headers) as r:self.assertEqual(r.status,200)
                     async with session.post(server.make_url('/api/command'),headers=headers,json={'command':'help'}) as r:self.assertEqual(r.status,200)
+    async def test_log_endpoint_requires_token(self):
+        import aiohttp
+        from aiohttp import web
+        from aiohttp.test_utils import TestServer
+        from free_gold import dashboard_auth,log_api
+        with patch.dict(os.environ,{'DASHBOARD_TOKEN':'test-secret'}):
+            app=web.Application(middlewares=[dashboard_auth]);app.router.add_get('/api/log',log_api)
+            async with TestServer(app) as server:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(server.make_url('/api/log')) as r:self.assertEqual(r.status,401)
+                    async with session.get(server.make_url('/api/log'),headers={'Authorization':'Bearer test-secret'}) as r:
+                        self.assertEqual(r.status,200);self.assertIn('ticker',await r.text())
     async def test_integrated_bot(self):
         import bot
         app=bot.create_app();self.assertIn('/dashboard',[r.resource.canonical for r in app.router.routes()])

@@ -10,7 +10,7 @@ import logging
 import statistics
 import html
 import sys
-from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, terminal_commands
+from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, log_api, terminal_commands
 from trade_controls import Execution
 from datetime import datetime, timezone
 from collections import deque
@@ -63,6 +63,7 @@ MIN_NET_EDGE_CENTS = 6.0
 MAX_SPREAD_CENTS = 12.0
 ALERT_COOLDOWN_SECONDS = 300
 SLIPPAGE_BUFFER_CENTS = 1
+FEE_RATE = 0.07  # Kalshi quadratic taker fee coefficient; free_gold.load_series applies the series fee_multiplier
 
 MIN_MINUTES_15M = 3.5
 MIN_MINUTES_1H = 10.0
@@ -274,7 +275,7 @@ def estimate_prob_above_strike(spot, strike, mins_left, vol_min, direction, bb_m
 
 def kalshi_taker_fee_cents(price_cents: float) -> float:
     p = max(0.01, min(0.99, price_cents / 100.0))
-    return 0.07 * p * (1.0 - p) * 100.0
+    return FEE_RATE * p * (1.0 - p) * 100.0
 
 
 # =====================================================================
@@ -529,7 +530,7 @@ async def poll_telegram_updates(session: aiohttp.ClientSession):
                 if command in ("/predict", "/test"):
                     await MONITOR.send_prediction(session, sys.modules[__name__], chat_id)
                     continue
-                if command in ("/gauge", "/feed", "/mute", "/unmute", "/threshold", "/help"):
+                if command in ("/gauge", "/feed", "/calibration", "/source", "/mute", "/unmute", "/threshold", "/help"):
                     await send_telegram_message(session, "<pre>" + html.escape(MONITOR.command(text)) + "</pre>", chat_id)
                     continue
 
@@ -576,7 +577,7 @@ async def background_worker_loop(app: web.Application):
         await send_telegram_message(
             session,
             f"🚀 <b>Kalshi Gold Bot online</b> ({mode})\n"
-            "Commands: /predict | /gauge | /feed | /status | /stats | /markets | /balance",
+            "Commands: /predict | /gauge | /feed | /calibration | /source | /status | /stats | /markets | /balance",
         )
 
         last_scan = 0.0
@@ -599,6 +600,7 @@ async def background_worker_loop(app: web.Application):
                     settled_reports = await STATE.tracker.check_settlements(session)
                     for rep in settled_reports:
                         await send_telegram_message(session, rep)
+                    await MONITOR.settle(session, sys.modules[__name__])
 
             except asyncio.CancelledError:
                 break
@@ -639,6 +641,7 @@ def create_app() -> web.Application:
     app.router.add_get("/health", handle_health)
     app.router.add_get("/dashboard", dashboard)
     app.router.add_get("/api/gold", state_api)
+    app.router.add_get("/api/log", log_api)
     app.router.add_post("/api/command", command_api)
     app.cleanup_ctx.append(worker_context)
     return app

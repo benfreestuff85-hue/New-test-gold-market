@@ -1,452 +1,921 @@
---- supplied_original/bot.py
-+++ updated/bot.py
-@@ -8,6 +8,10 @@
- import asyncio
- import logging
+diff -ruN supplied_original/README.md updated/README.md
+--- supplied_original/README.md	2026-11-09 12:31:10.458346507 -0800
++++ updated/README.md	2026-11-09 12:31:10.460104618 -0800
+@@ -1,7 +1,42 @@
+-# Complete gold bot — explicit YES/NO selector
++# Complete gold bot — zero-drift forecasts, separate hourly, settlement logger
++
++## What changed in THIS update (read first)
++Why: a simulation of the previous model (random-walk gold, efficient market) showed the 15m and 1h
++rows shared one drift/volatility input, and the drift extrapolation made probabilities badly
++overconfident (Brier 0.221 vs 0.180 ideal; "97%" calls came true 81% of the time).
++* Probability model (both markets): zero drift, P(YES)=Φ((ln(S/K) − σ²T/2)/√(σ²T + basis²)),
++  K = the contract's structured strike (floor/cap). Clamped to 2–98. No drift extrapolation, no "projected finish".
++  Re-simulated on this code: Brier within 0.0006 of ideal; "edge ≥ 6¢" fake alerts fell from ~60% of samples to ~0.1%.
++  Simulation assumes a random walk and an efficient market; real gold has jumps. Judge it with /calibration, not with this.
++* Volatility: RMS close-to-close per-minute log return (the old open→close version under-measured: 0.80× true at 20 s feeds),
++  ×GOLD_VOL_MULT (default 1.1), floor GOLD_VOL_FLOOR. Gap-tolerant: a missing minute no longer blanks the model for an hour.
++* Hourly is now its own forecast: own contract, strike, time left and its own 5-minute-candle volatility
++  (1m-candle fallback while 5m history warms up). It shows target/YES-NO/score like the 15m. Still NO hourly trade controls.
++  They remain correlated because both track the same gold price; the strike, time left and volatility window differ.
++* Momentum gauge: display only. Needs a FULL lookback (15 min / 60 min) of history; no truncated "1h" gauge after startup.
++  Momentum-threshold ALERTS are OFF by default (MOMENTUM_ALERTS=true to re-enable). Reversal+edge alerts remain.
++* Restored the minimum-time gate lost in the earlier rewrite: no alert with < MIN_MINUTES_15M (3.5 min) left;
++  /predict warns "final minutes" under the limit (hourly: MIN_MINUTES_1H).
++* Expiry time order is now expected_expiration_time → close_time → expiration_time (the latter can be hours after the
++  window). A 15m/1h contract whose expiry is implausibly far away is withheld, not forecast. Verify with the logs.
++* Candle history resets after a 300 s feed gap (was 120 s).
++* NEW forecast_log.py (SQLite): logs a forecast every 30 s per selected contract and, after Kalshi publishes the result,
++  records result, expiration_value, floor_strike and OUR proxy's 1-minute candle closes at window start/end.
++  /calibration = model vs Kalshi-mid Brier at fixed lead times plus proxy-vs-Kalshi basis. Needs ~30+ settled markets to mean anything.
++* NEW /source: shows settlement_sources, contract terms URL and fee settings straight from Kalshi's series data.
++  VERIFY the settlement source there; the "Pyth 1-minute candle close vs the start candle close" description came from a
++  third-party site and is unconfirmed. Kalshi's fee_multiplier (if quadratic) now scales the 7% fee.
++* NEW GET /api/log (Bearer DASHBOARD_TOKEN) downloads the log as CSV.
++* GOLD_BASIS_USD (default 0.75, a guess) = 1σ proxy-vs-index error. Replace it with the sd from /calibration "end" basis.
++* The SQLite file is on Render's ephemeral disk: it is lost on redeploy/restart unless FORECAST_DB points at a persistent disk.
++  Download /api/log before redeploying.
++Not changed: trade_controls.py, order/sell logic, owner binding, selector UI. Legacy estimate_prob_above_strike and
++compute_realized_vol_per_min in bot.py are now unused (kept to keep the diff small).
++
++# (Earlier README follows; superseded where it conflicts with the section above)
+ 
+ ## Deploy this complete package
+-Replace bot.py, free_gold.py AND trade_controls.py together in your Render-linked
++Replace bot.py, free_gold.py, forecast_log.py (new) AND trade_controls.py together in your Render-linked
+ repository; also upload requirements.txt. No earlier generated runtime module needed.
+ This extends the supplied original bot.py and includes the agreed free-feed build,
+ compact reports and trade controls. It was not retrieved from your live deployment.
+@@ -12,12 +47,12 @@
+ Render Start Command: python bot.py
+ Commit the files, then deploy latest commit. Do not paste shell commands into Python.
+ Keep Telegram/Kalshi keys in Render Environment, not source control.
+-Existing DASHBOARD_TOKEN works. No paid Pyth subscription or gold feed API key.
++Existing DASHBOARD_TOKEN works. New optional env: GOLD_VOL_MULT, GOLD_VOL_FLOOR, GOLD_BASIS_USD, MOMENTUM_ALERTS, FORECAST_DB. No paid Pyth subscription or gold feed API key.
+ ENABLE_LIVE_ORDERS defaults false; keep false during deployment/demo testing.
+ The package does NOT reset existing Render environment values (including true).
+ 
+ ## Trading UI: 15-minute only
+-/predict and /test send one formatted report, with ONE 15-minute and ONE hourly forecast.
++/predict and /test send one formatted report, with ONE 15-minute and ONE hourly forecast (hourly has no controls).
+ Initially:
+   SELL ALL — actual held side/quantity at last check (15M)
+   Select YES | Select NO
+@@ -64,7 +99,7 @@
+ /mute /unmute /threshold 65 /help available through Telegram; omit / in terminal/dashboard.
+ Mute suppresses alerts, not manual trades or official-result tracking.
+ Original RSI/Bollinger reversal and edge/spread filters retained for selected 15m.
+-Combined alert triggers on qualifying reversal or momentum threshold crossing, with
++Alerts trigger on a qualifying reversal+edge (and, only if MOMENTUM_ALERTS=true, a momentum threshold crossing), with
+ original 300s cooldown and 10-point hysteresis. No auto orders added.
+ Qualifying 15m reversal signals paper logged independently of manual selection.
+ Original paper accounting is per-signal and excludes fees; not account execution PnL.
+@@ -85,12 +120,12 @@
+ not guaranteed. A prior public response was stale; verify freshness in your deployment.
+ 
+ Provider timestamps build candles; repeated timestamp does not fabricate new observations.
+->120s gaps reset 1m/5m histories; noncontiguous minute history blocks model output.
+-~20 completed 1m candles warm-up. Early hourly gauge uses less than full-hour history.
+-Projection uses clipped log-return drift and normal uncertainty; scores UNCALIBRATED.
++>300s gaps reset 1m/5m histories; missing single minutes are tolerated.
++~20 completed 1m candles warm-up (hourly: 12 completed 5m candles, 1m fallback before). Gauges need a full lookback.
++Zero-drift normal model with proxy-basis uncertainty; scores UNCALIBRATED until /calibration has enough data.
+ Free spot is a PROXY, not exact Pyth index. No profitability or accuracy guarantee.
+ Kalshi published yes/no is sole source of official paper-trade settlement.
+-Approximate horizon: expected_expiration_time, expiration_time, then close_time.
++Approximate horizon: expected_expiration_time, close_time, then expiration_time.
+ These are not independently verified contractual observation windows. No averaging,
+ rounding or candlestick settlement adapter is implemented. Do not confuse forecast
+ with exact index settlement replication.
+@@ -134,8 +169,11 @@
+ 
+ ## Tests actually performed
+ python -m unittest -v test_update.py
+-53 automated tests passed. Captured output: TEST_RESULTS.txt.
+-Coverage: explicit selection, independent model/manual sides, switching revocation,
++71 automated tests passed (53 earlier + 18 new/replaced). Captured output: TEST_RESULTS.txt.
++Coverage added in this update: zero-drift probability and clamping, basis effect, trend not biasing probability, gap tolerance,
++full-lookback gauges, expiry order and implausible expiry, hourly own prediction, settlement recording, unpublished results,
++Brier vs Kalshi mid, log failure safety, fee multiplier, min-time alert gate, momentum alerts off, /api/log auth.
++Coverage earlier: explicit selection, independent model/manual sides, switching revocation,
+ message/owner binding, no orders on selector taps, duplicate handling, missing asks,
+ UI-edit failures, 15m-only trading, partial/zero/fractional/full liquidation, netting,
+ pagination, timeout/no retry, live disable, buy price cap, report cardinality and gauges.
+@@ -145,6 +183,6 @@
+ 
+ ## Package contents
+ bot.py, free_gold.py, trade_controls.py, requirements.txt, env.example,
+-test_update.py, TEST_RESULTS.txt, changes.diff, README.md, MANIFEST.json.
++test_update.py, forecast_log.py, TEST_RESULTS.txt, changes.diff, README.md, MANIFEST.json.
+ env.example is a reference, not automatically loaded. No credentials included.
+ Manifest provides SHA256/size; ZIP verified for integrity before delivery.
+diff -ruN supplied_original/bot.py updated/bot.py
+--- supplied_original/bot.py	2026-11-09 12:31:10.458244762 -0800
++++ updated/bot.py	2026-11-09 12:31:10.459999989 -0800
+@@ -10,7 +10,7 @@
  import statistics
-+import html
-+import sys
-+from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, terminal_commands
-+from trade_controls import Execution
+ import html
+ import sys
+-from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, terminal_commands
++from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, log_api, terminal_commands
+ from trade_controls import Execution
  from datetime import datetime, timezone
  from collections import deque
- import aiohttp
-@@ -41,13 +45,11 @@
- )
- KALSHI_API_PREFIX = "/trade-api/v2"
- KALSHI_BASE_URL = f"{KALSHI_HOST}{KALSHI_API_PREFIX}"
--GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLD1H", "KXGOLDD"]
--
--# Pyth Network Hermes API for Metal.XAU/USD (Spot Gold)
--PYTH_XAU_FEED_ID = "0x765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
--PYTH_HERMES_URL = (
--    f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={PYTH_XAU_FEED_ID}"
--)
-+GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLDH"]
-+
-+# Free spot proxy; no paid Pyth subscription and no alternate-provider fallback.
-+ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
-+TERMINAL_OUTPUT = os.getenv("TERMINAL_OUTPUT", "true").lower() == "true"
+@@ -63,6 +63,7 @@
+ MAX_SPREAD_CENTS = 12.0
+ ALERT_COOLDOWN_SECONDS = 300
+ SLIPPAGE_BUFFER_CENTS = 1
++FEE_RATE = 0.07  # Kalshi quadratic taker fee coefficient; free_gold.load_series applies the series fee_multiplier
  
- # Strategy, Filter & Paper Trading Parameters
- POLL_INTERVAL_SECONDS = 5
-@@ -135,57 +137,9 @@
-     }
+ MIN_MINUTES_15M = 3.5
+ MIN_MINUTES_1H = 10.0
+@@ -274,7 +275,7 @@
+ 
+ def kalshi_taker_fee_cents(price_cents: float) -> float:
+     p = max(0.01, min(0.99, price_cents / 100.0))
+-    return 0.07 * p * (1.0 - p) * 100.0
++    return FEE_RATE * p * (1.0 - p) * 100.0
  
  
--async def place_kalshi_order(
--    session: aiohttp.ClientSession,
--    ticker: str,
--    outcome: str,
--    ask_cents: int,
--    contracts: int,
--) -> tuple[bool, str]:
--    if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
--        return (
--            False,
--            "⚠️ <b>Missing Kalshi Credentials:</b> Add <code>KALSHI_KEY_ID</code> and <code>KALSHI_PRIVATE_KEY</code> in Render.",
--        )
--
--    capped_price = min(99, max(1, ask_cents + SLIPPAGE_BUFFER_CENTS))
--    v2_side = "bid" if outcome.upper() == "YES" else "ask"
--
--    # V2 price mapping for YES vs NO positions
--    if outcome.upper() == "YES":
--        yes_price_val = capped_price / 100.0
--    else:
--        yes_price_val = (100 - capped_price) / 100.0
--
--    path = f"{KALSHI_API_PREFIX}/portfolio/events/orders"
--    url = f"{KALSHI_HOST}{path}"
--    payload = {
--        "ticker": ticker,
--        "client_order_id": str(uuid.uuid4()),
--        "side": v2_side,
--        "count": int(contracts),
--        "price": f"{yes_price_val:.2f}",
--        "time_in_force": "immediate_or_cancel",
--        "self_trade_prevention_type": "taker_at_cross",
--    }
--
--    try:
--        headers = build_kalshi_auth_headers("POST", path)
--        async with session.post(url, headers=headers, json=payload, timeout=8) as resp:
--            body = await resp.text()
--            if resp.status in (200, 201):
--                data = json.loads(body)
--                order_info = data.get("order", {})
--                return (
--                    True,
--                    f"✅ <b>KALSHI ORDER SUBMITTED</b>\n"
--                    f"<b>Ticker:</b> <code>{ticker}</code>\n"
--                    f"<b>Action:</b> BUY {contracts}x {outcome} @ ≤{capped_price}¢\n"
--                    f"<b>Status:</b> <code>{order_info.get('status', 'submitted')}</code>",
--                )
--            return False, f"❌ <b>Rejected ({resp.status}):</b>\n<code>{body[:250]}</code>"
--    except Exception as e:
--        return False, f"❌ <b>Exception:</b> <code>{e}</code>"
-+async def place_kalshi_order(session, ticker, outcome, ask_cents, contracts):
-+    # Legacy callers cannot bypass explicit side selection and quote binding.
-+    return False, "Use /predict, select YES or NO, then use its current buy buttons."
- 
- 
- async def fetch_kalshi_balance(session: aiohttp.ClientSession) -> str:
-@@ -430,71 +384,52 @@
- 
- 
- STATE = GoldAnalyzerState()
--
--
--async def fetch_spot_gold_price(session: aiohttp.ClientSession) -> float | None:
-+EXECUTION = Execution(sys.modules[__name__])
-+
-+
-+async def fetch_spot_gold_price(session):
-+    return await MONITOR.fetch(session, STATE)
-+
-+
-+def parse_strike(m):
-+    kind = m.get("strike_type")
-+    key = "floor_strike" if kind in ("greater", "greater_or_equal") else "cap_strike" if kind in ("less", "less_or_equal") else None
-+    if not key:
-+        return None
-     try:
--        async with session.get(PYTH_HERMES_URL, timeout=4) as resp:
--            if resp.status == 200:
--                data = await resp.json()
--                parsed = data.get("parsed", [])
--                if parsed:
--                    p_obj = parsed[0].get("price", {})
--                    spot = float(p_obj.get("price", 0)) * (10 ** int(p_obj.get("expo", 0)))
--                    if spot > 500:
--                        STATE.spot_source = "Pyth XAU/USD"
--                        return round(spot, 2)
--    except Exception:
--        pass
--
--    try:
--        async with session.get("https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD", timeout=4) as resp:
--            if resp.status == 200:
--                data = await resp.json()
--                if data and "spreadProfilePrices" in data[0]:
--                    pr = data[0]["spreadProfilePrices"][0]
--                    mid = (float(pr["bid"]) + float(pr["ask"])) / 2.0
--                    if mid > 500:
--                        STATE.spot_source = "Swissquote (Fallback)"
--                        return round(mid, 2)
--    except Exception:
--        pass
--    return None
--
--
--def parse_strike(m: dict) -> float | None:
--    for k in ("floor_strike", "cap_strike", "strike_price", "custom_strike"):
--        v = m.get(k)
--        if isinstance(v, (int, float)) and v > 500:
--            return float(v)
--    text = f"{m.get('subtitle', '')} {m.get('yes_sub_title', '')} {m.get('title', '')}".replace(",", "").replace("$", "")
--    for t in text.split():
--        try:
--            val = float(t)
--            if 1500 < val < 15000:
--                return val
--        except ValueError:
--            continue
--    return None
-+        value = float(m[key])
-+        return value if math.isfinite(value) and value > 0 else None
-+    except (KeyError, TypeError, ValueError):
-+        return None
- 
- 
- def parse_close_time(m: dict) -> str | None:
-     return m.get("close_time") or m.get("expiration_time")
- 
- 
--async def fetch_kalshi_gold_markets(session: aiohttp.ClientSession) -> list[dict]:
-+async def fetch_kalshi_gold_markets(session):
-     markets = []
-     for series in GOLD_SERIES_TICKERS:
--        url = f"{KALSHI_BASE_URL}/markets?series_ticker={series}&status=open&limit=50"
--        try:
--            async with session.get(url, timeout=6) as resp:
--                if resp.status == 200:
--                    data = await resp.json()
--                    for m in data.get("markets", []):
--                        m["series_ticker"] = series
--                        markets.append(m)
--        except Exception:
--            pass
-+        cursor = None
-+        seen = set()
-+        for _ in range(20):
-+            params = {"series_ticker": series, "status": "open", "limit": 200}
-+            if cursor:
-+                params["cursor"] = cursor
-+            try:
-+                async with session.get(f"{KALSHI_BASE_URL}/markets", params=params, timeout=6) as response:
-+                    response.raise_for_status()
-+                    data = await response.json()
-+                for market in data.get("markets", []):
-+                    market["series_ticker"] = series
-+                    markets.append(market)
-+                cursor = data.get("cursor")
-+                if not cursor or cursor in seen:
-+                    break
-+                seen.add(cursor)
-+            except Exception as exc:
-+                logger.warning("Market lookup failed for %s: %s", series, exc)
-+                break
-     return markets
- 
- 
-@@ -505,13 +440,15 @@
-             if resp.status != 200:
-                 return None
-             data = await resp.json()
--            ob = data.get("orderbook", {})
-+            ob = data.get("orderbook_fp") or data.get("orderbook", {})
- 
-             yd, nd = ob.get("yes_dollars"), ob.get("no_dollars")
-+            if yd: yd = sorted(yd, key=lambda level: float(level[0]))
-+            if nd: nd = sorted(nd, key=lambda level: float(level[0]))
-             if yd is not None or nd is not None:
--                yes_bid = round(float(yd[-1][0]) * 100) if yd else None
-+                yes_bid = float(yd[-1][0]) * 100 if yd else None
-                 yes_qty = float(yd[-1][1]) if yd else 0
--                no_bid = round(float(nd[-1][0]) * 100) if nd else None
-+                no_bid = float(nd[-1][0]) * 100 if nd else None
-                 no_qty = float(nd[-1][1]) if nd else 0
-             else:
-                 yb, nb = ob.get("yes") or [], ob.get("no") or []
-@@ -540,17 +477,9 @@
  # =====================================================================
- # TELEGRAM BOT & COMMANDS
- # =====================================================================
--def build_keyboard(ticker: str, outcome: str, ask_cents: int) -> dict:
--    c = int(round(ask_cents))
--    return {
--        "inline_keyboard": [
--            [
--                {"text": f"⚡ Buy 1 {outcome} @ {c}¢", "callback_data": f"BUY|{ticker}|{outcome}|{c}|1"},
--                {"text": f"⚡ Buy 5 {outcome} @ {c}¢", "callback_data": f"BUY|{ticker}|{outcome}|{c}|5"},
--                {"text": f"⚡ Buy 10 {outcome} @ {c}¢", "callback_data": f"BUY|{ticker}|{outcome}|{c}|10"},
--            ]
--        ]
--    }
-+def build_keyboard(ticker, outcome, ask_cents):
-+    # No old, preselected buy controls. New controls are made by GoldMonitor.
-+    return None
- 
- 
- async def send_telegram_message(session: aiohttp.ClientSession, text: str, chat_id: str | None = None, reply_markup: dict | None = None):
-@@ -565,6 +494,9 @@
-         async with session.post(url, json=payload, timeout=6) as resp:
-             if resp.status != 200:
-                 logger.warning(f"Telegram sendMessage failed: HTTP {resp.status}")
-+                return None
-+            result = await resp.json()
-+            return result.get("result") if result.get("ok") else None
-     except Exception as e:
-         logger.warning(f"Telegram sendMessage error: {e}")
- 
-@@ -584,23 +516,21 @@
- 
-                 cb = item.get("callback_query")
-                 if cb:
--                    cb_id, cb_data = cb.get("id"), cb.get("data", "")
--                    from_chat = str(cb.get("message", {}).get("chat", {}).get("id", ""))
--                    if not is_authorized(from_chat):
--                        continue
--                    if cb_data.startswith("BUY|"):
--                        parts = cb_data.split("|")
--                        if len(parts) == 5:
--                            _, tkr, outcome, price_s, qty_s = parts
--                            await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": f"Submitting {qty_s}x {outcome}..."})
--                            ok, msg = await place_kalshi_order(session, tkr, outcome, int(price_s), int(qty_s))
--                            await send_telegram_message(session, msg, from_chat)
-+                    await MONITOR.callback(session, sys.modules[__name__], cb)
+@@ -529,7 +530,7 @@
+                 if command in ("/predict", "/test"):
+                     await MONITOR.send_prediction(session, sys.modules[__name__], chat_id)
+                     continue
+-                if command in ("/gauge", "/feed", "/mute", "/unmute", "/threshold", "/help"):
++                if command in ("/gauge", "/feed", "/calibration", "/source", "/mute", "/unmute", "/threshold", "/help"):
+                     await send_telegram_message(session, "<pre>" + html.escape(MONITOR.command(text)) + "</pre>", chat_id)
                      continue
  
-                 msg = item.get("message", {})
-                 text = (msg.get("text") or "").strip().lower()
-                 chat_id = str(msg.get("chat", {}).get("id", ""))
-                 if not text or not is_authorized(chat_id):
-+                    continue
-+
-+                command = text.split()[0].split("@")[0]
-+                if command in ("/predict", "/test"):
-+                    await MONITOR.send_prediction(session, sys.modules[__name__], chat_id)
-+                    continue
-+                if command in ("/gauge", "/feed", "/mute", "/unmute", "/threshold", "/help"):
-+                    await send_telegram_message(session, "<pre>" + html.escape(MONITOR.command(text)) + "</pre>", chat_id)
-                     continue
- 
-                 if text.startswith("/status") or text.startswith("/start"):
-@@ -618,9 +548,6 @@
-                     await send_telegram_message(session, b_msg, chat_id)
-                 elif text.startswith("/stats"):
-                     await send_telegram_message(session, STATE.tracker.get_stats_summary(), chat_id)
--                elif text.startswith("/test"):
--                    kb = build_keyboard("KXGOLD15M-TEST", "YES", 35)
--                    await send_telegram_message(session, "🧪 Test alert with execution buttons:", chat_id, reply_markup=kb)
-                 elif text.startswith("/markets"):
-                     markets = await fetch_kalshi_gold_markets(session)
-                     lines = ["<b>🏅 OPEN KALSHI GOLD MARKETS</b>"]
-@@ -638,92 +565,8 @@
- # =====================================================================
- # SCANNER & OPPORTUNITY ENGINE
- # =====================================================================
--async def evaluate_markets_and_alert(session: aiohttp.ClientSession):
--    spot = STATE.latest_spot
--    if spot is None:
--        return
--
--    sig_1m = detect_reversal_signal(STATE.candles_1m, "1m")
--    sig_5m = detect_reversal_signal(STATE.candles_5m, "5m")
--    active_sig = sig_1m if sig_1m["direction"] != "NEUTRAL" else sig_5m
--    direction = active_sig["direction"]
--
--    markets = await fetch_kalshi_gold_markets(session)
--    STATE.active_markets_count = len(markets)
--
--    if direction == "NEUTRAL" or not markets:
--        return
--
--    vol_min = compute_realized_vol_per_min(STATE.candles_1m.get_closes())
--    bb_mid = active_sig["bb"][1] if active_sig["bb"] else None
--    now = time.time()
--
--    for m in markets:
--        ticker = m.get("ticker", "")
--        series = m.get("series_ticker", "")
--        if not ticker or now - STATE.last_alerts.get(ticker, 0) < ALERT_COOLDOWN_SECONDS:
--            continue
--
--        strike = parse_strike(m)
--        close_str = parse_close_time(m)
--        if not strike or not close_str:
--            continue
--
--        try:
--            dt = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
--            mins_left = (dt - datetime.now(timezone.utc)).total_seconds() / 60.0
--        except Exception:
--            continue
--
--        if "15M" in series and (mins_left < MIN_MINUTES_15M or mins_left > 16.0):
--            continue
--        if "1H" in series and (mins_left < MIN_MINUTES_1H or mins_left > 65.0):
--            continue
--
--        ob = await fetch_orderbook_details(session, ticker)
--        if not ob or ob["spread"] > MAX_SPREAD_CENTS:
--            continue
--
--        prob_yes = estimate_prob_above_strike(spot, strike, mins_left, vol_min, direction, bb_mid)
--        fair_yes, fair_no = prob_yes * 100.0, (1.0 - prob_yes) * 100.0
--
--        if direction == "BULLISH" and ob["yes_ask"] is not None:
--            ask = float(ob["yes_ask"])
--            fee = kalshi_taker_fee_cents(ask)
--            net_edge = fair_yes - ask - fee
--
--            if net_edge >= MIN_NET_EDGE_CENTS and 8 <= ask <= 85:
--                STATE.last_alerts[ticker] = now
--                STATE.tracker.log_signal(ticker, "YES", ask, strike, net_edge, close_str)
--                kb = build_keyboard(ticker, "YES", int(round(ask)))
--                msg = (
--                    f"🟢 <b>BULLISH GOLD REVERSAL — BUY YES</b>\n"
--                    f"<b>Contract:</b> <code>{ticker}</code> ({mins_left:.1f}m left)\n"
--                    f"<b>Strike:</b> ${strike:,.2f} | <b>Spot:</b> ${spot:,.2f}\n"
--                    f"<b>Trigger:</b> {active_sig['reason']}\n"
--                    f"<b>Kalshi Ask:</b> {ask:.0f}¢ (Spread: {ob['spread']:.0f}¢) | <b>Fair Value:</b> {fair_yes:.1f}¢\n"
--                    f"<b>Net Edge:</b> <b>+{net_edge:.1f}¢</b> (Paper trade logged ✅)"
--                )
--                await send_telegram_message(session, msg, reply_markup=kb)
--
--        elif direction == "BEARISH" and ob["no_ask"] is not None:
--            ask = float(ob["no_ask"])
--            fee = kalshi_taker_fee_cents(ask)
--            net_edge = fair_no - ask - fee
--
--            if net_edge >= MIN_NET_EDGE_CENTS and 8 <= ask <= 85:
--                STATE.last_alerts[ticker] = now
--                STATE.tracker.log_signal(ticker, "NO", ask, strike, net_edge, close_str)
--                kb = build_keyboard(ticker, "NO", int(round(ask)))
--                msg = (
--                    f"🔴 <b>BEARISH GOLD REVERSAL — BUY NO</b>\n"
--                    f"<b>Contract:</b> <code>{ticker}</code> ({mins_left:.1f}m left)\n"
--                    f"<b>Strike:</b> ${strike:,.2f} | <b>Spot:</b> ${spot:,.2f}\n"
--                    f"<b>Trigger:</b> {active_sig['reason']}\n"
--                    f"<b>Kalshi Ask:</b> {ask:.0f}¢ (Spread: {ob['spread']:.0f}¢) | <b>Fair Value:</b> {fair_no:.1f}¢\n"
--                    f"<b>Net Edge:</b> <b>+{net_edge:.1f}¢</b> (Paper trade logged ✅)"
--                )
--                await send_telegram_message(session, msg, reply_markup=kb)
-+async def evaluate_markets_and_alert(session):
-+    await MONITOR.maybe_alert(session, sys.modules[__name__])
- 
- 
- async def background_worker_loop(app: web.Application):
-@@ -733,7 +576,7 @@
+@@ -576,7 +577,7 @@
          await send_telegram_message(
              session,
              f"🚀 <b>Kalshi Gold Bot online</b> ({mode})\n"
--            "Commands: /status | /stats | /markets | /balance",
-+            "Commands: /predict | /gauge | /feed | /status | /stats | /markets | /balance",
+-            "Commands: /predict | /gauge | /feed | /status | /stats | /markets | /balance",
++            "Commands: /predict | /gauge | /feed | /calibration | /source | /status | /stats | /markets | /balance",
          )
  
          last_scan = 0.0
-@@ -742,17 +585,14 @@
-             try:
-                 now = time.time()
-                 spot = await fetch_spot_gold_price(session)
--                if spot is not None:
--                    STATE.latest_spot = spot
--                    STATE.latest_spot_ts = now
--                    STATE.candles_1m.update(spot, now)
--                    STATE.candles_5m.update(spot, now)
--
-                 await poll_telegram_updates(session)
+@@ -599,6 +600,7 @@
+                     settled_reports = await STATE.tracker.check_settlements(session)
+                     for rep in settled_reports:
+                         await send_telegram_message(session, rep)
++                    await MONITOR.settle(session, sys.modules[__name__])
  
-                 if now - last_scan >= SCAN_INTERVAL_SECONDS:
-                     last_scan = now
-+                    await MONITOR.refresh(session, sys.modules[__name__])
-                     await evaluate_markets_and_alert(session)
-+                    if TERMINAL_OUTPUT:
-+                        print(MONITOR.command("predict"), flush=True)
- 
-                 if now - last_settlement_check >= 60.0:
-                     last_settlement_check = now
-@@ -776,6 +616,8 @@
-         "status": "online",
-         "spot_gold": STATE.latest_spot,
-         "spot_source": STATE.spot_source,
-+        "quote_fresh": MONITOR.fresh(),
-+        "feed_status": MONITOR.status,
-         "open_trades": len(STATE.tracker.open_trades),
-         "settled_trades": len(STATE.tracker.settled_trades),
-     })
-@@ -784,15 +626,20 @@
- async def worker_context(app: web.Application):
-     """Start the background worker with the server and stop it cleanly on shutdown."""
-     task = asyncio.create_task(background_worker_loop(app))
-+    commands = asyncio.create_task(terminal_commands())
-     yield
-     task.cancel()
--    await asyncio.gather(task, return_exceptions=True)
-+    commands.cancel()
-+    await asyncio.gather(task, commands, return_exceptions=True)
- 
- 
- def create_app() -> web.Application:
--    app = web.Application()
-+    app = web.Application(middlewares=[dashboard_auth], client_max_size=4096)
-     app.router.add_get("/", handle_health)
+             except asyncio.CancelledError:
+                 break
+@@ -639,6 +641,7 @@
      app.router.add_get("/health", handle_health)
-+    app.router.add_get("/dashboard", dashboard)
-+    app.router.add_get("/api/gold", state_api)
-+    app.router.add_post("/api/command", command_api)
+     app.router.add_get("/dashboard", dashboard)
+     app.router.add_get("/api/gold", state_api)
++    app.router.add_get("/api/log", log_api)
+     app.router.add_post("/api/command", command_api)
      app.cleanup_ctx.append(worker_context)
      return app
+diff -ruN supplied_original/env.example updated/env.example
+--- supplied_original/env.example	2026-11-09 12:31:10.458358525 -0800
++++ updated/env.example	2026-11-09 12:31:10.460120397 -0800
+@@ -11,3 +11,11 @@
+ DASHBOARD_TOKEN=
+ TERMINAL_OUTPUT=true
+ PORT=10000
++# Model/logging (all optional; defaults shown)
++GOLD_VOL_MULT=1.1
++GOLD_VOL_FLOOR=0.0001
++# 1-sigma proxy-vs-Pyth-index error in USD. Guess until /calibration shows the real basis.
++GOLD_BASIS_USD=0.75
++MOMENTUM_ALERTS=false
++# SQLite path. Render disks are ephemeral unless you attach a persistent disk; download /api/log before redeploys.
++FORECAST_DB=forecast_log.db
+diff -ruN supplied_original/forecast_log.py updated/forecast_log.py
+--- supplied_original/forecast_log.py	1969-12-31 16:00:00.000000000 -0800
++++ updated/forecast_log.py	2026-11-09 12:31:10.460028004 -0800
+@@ -0,0 +1,215 @@
++"""SQLite log of every forecast and its official Kalshi settlement. Stdlib only.
++
++Purpose: measure whether the model beats the Kalshi mid price (Brier score) and how far
++the free spot proxy is from the Pyth index Kalshi settles on (basis). Every method is
++best-effort and never raises into the trading loop.
++"""
++import csv
++import io
++import logging
++import math
++import sqlite3
++import statistics
++
++logger = logging.getLogger("KalshiGoldBot")
++
++# Forecast snapshots scored at these seconds-before-end (nearest row within LEAD_TOL).
++LEADS = {15: (600, 300, 180), 60: (2700, 1800, 900)}
++LEAD_TOL = 45
++LOG_EVERY_SECONDS = 30
++MIN_SAMPLE = 30
++
++SCHEMA = """
++CREATE TABLE IF NOT EXISTS markets(
++  ticker TEXT PRIMARY KEY, minutes INTEGER, strike REAL, strike_type TEXT,
++  close_time TEXT, expected_exp TEXT, expiration_time TEXT, end_ts REAL, first_seen REAL,
++  result TEXT, expiration_value REAL, settle_strike REAL,
++  proxy_start REAL, proxy_end REAL, settled_at REAL);
++CREATE TABLE IF NOT EXISTS forecasts(
++  id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, ticker TEXT, minutes INTEGER, spot REAL,
++  strike REAL, seconds_left INTEGER, sigma_min REAL, p_yes REAL, momentum REAL,
++  yes_bid REAL, yes_ask REAL, feed_age REAL);
++CREATE INDEX IF NOT EXISTS forecasts_ticker ON forecasts(ticker);
++"""
++
++
++def number(value):
++    try:
++        out = float(value)
++        return out if math.isfinite(out) else None
++    except (TypeError, ValueError):
++        return None
++
++
++class ForecastLog:
++    def __init__(self, path):
++        self.path = path
++        self.db = None
++        self.disabled = False
++        self.last = {}
++
++    def _db(self):
++        if self.db is None and not self.disabled:
++            try:
++                self.db = sqlite3.connect(self.path)
++                self.db.executescript(SCHEMA)
++            except Exception as exc:
++                logger.warning("Forecast log disabled (%s): %s", self.path, exc)
++                self.disabled = True
++                self.db = None
++        return self.db
++
++    def record(self, market, row, sigma_min, spot, feed_age, now, end_ts):
++        """Register the contract and, if the model produced a probability, log one forecast."""
++        db = self._db()
++        if db is None or not market or end_ts is None:
++            return
++        try:
++            ticker = market["ticker"]
++            db.execute(
++                "INSERT OR IGNORE INTO markets(ticker,minutes,first_seen,close_time,expected_exp,expiration_time)"
++                " VALUES(?,?,?,?,?,?)",
++                (ticker, row["minutes"], now, market.get("close_time"),
++                 market.get("expected_expiration_time"), market.get("expiration_time")),
++            )
++            db.execute(
++                "UPDATE markets SET strike=?, strike_type=?, end_ts=? WHERE ticker=? AND result IS NULL",
++                (row.get("target"), market.get("strike_type"), end_ts, ticker),
++            )
++            if row.get("yes_score") is not None and now - self.last.get(ticker, 0) >= LOG_EVERY_SECONDS:
++                quotes = row.get("quotes") or {}
++                db.execute(
++                    "INSERT INTO forecasts(ts,ticker,minutes,spot,strike,seconds_left,sigma_min,p_yes,momentum,"
++                    "yes_bid,yes_ask,feed_age) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
++                    (now, ticker, row["minutes"], spot, row.get("target"), row.get("seconds_left"), sigma_min,
++                     row["yes_score"] / 100.0, row.get("momentum"), quotes.get("yes_bid"), quotes.get("yes_ask"),
++                     feed_age),
++                )
++                self.last[ticker] = now
++                if len(self.last) > 500:
++                    self.last = {ticker: now}
++            db.commit()
++        except Exception as exc:
++            logger.warning("Forecast log write failed: %s", exc)
++
++    def pending(self, now):
++        db = self._db()
++        if db is None:
++            return []
++        try:
++            return db.execute(
++                "SELECT ticker,minutes,end_ts FROM markets WHERE settled_at IS NULL AND end_ts IS NOT NULL"
++                " AND end_ts<=? AND end_ts>=? ORDER BY end_ts LIMIT 20",
++                (now - 30, now - 172800),
++            ).fetchall()
++        except Exception as exc:
++            logger.warning("Forecast log read failed: %s", exc)
++            return []
++
++    def settle(self, ticker, result, expiration_value, settle_strike, proxy_start, proxy_end, now):
++        db = self._db()
++        if db is None:
++            return
++        try:
++            db.execute(
++                "UPDATE markets SET result=?, expiration_value=?, settle_strike=?, proxy_start=?, proxy_end=?,"
++                " settled_at=? WHERE ticker=?",
++                (result, expiration_value, settle_strike, proxy_start, proxy_end, now, ticker),
++            )
++            db.commit()
++        except Exception as exc:
++            logger.warning("Forecast log settle failed: %s", exc)
++
++    # ------------------------------------------------------------------ reports
++    def _scored(self, db, minutes, lead):
++        pairs = []
++        markets = db.execute(
++            "SELECT ticker,result FROM markets WHERE minutes=? AND result IN ('yes','no')", (minutes,)
++        ).fetchall()
++        for ticker, result in markets:
++            hit = db.execute(
++                "SELECT p_yes,yes_bid,yes_ask FROM forecasts WHERE ticker=? AND ABS(seconds_left-?)<=?"
++                " ORDER BY ABS(seconds_left-?) LIMIT 1",
++                (ticker, lead, LEAD_TOL, lead),
++            ).fetchone()
++            if hit:
++                p, bid, ask = hit
++                mid = (bid + ask) / 200.0 if bid is not None and ask is not None else None
++                pairs.append((p, mid, 1.0 if result == "yes" else 0.0))
++        return pairs
++
++    @staticmethod
++    def _stats(values):
++        if not values:
++            return "n=0"
++        sd = statistics.pstdev(values) if len(values) > 1 else 0.0
++        return (f"n={len(values)} mean {statistics.mean(values):+.2f} sd {sd:.2f} "
++                f"max|x| {max(abs(v) for v in values):.2f} USD")
++
++    def calibration(self):
++        db = self._db()
++        if db is None:
++            return "Forecast log unavailable."
++        try:
++            out = ["CALIBRATION (settled markets, official Kalshi result)",
++                   "Brier: lower is better; 0.250 = always saying 50%."]
++            total = 0
++            for minutes, label in ((15, "15m"), (60, "1h")):
++                for lead in LEADS[minutes]:
++                    pairs = self._scored(db, minutes, lead)
++                    total += len(pairs)
++                    if not pairs:
++                        out.append(f"{label} ~{lead // 60}m left: no scored markets yet")
++                        continue
++                    model = statistics.mean((p - y) ** 2 for p, _, y in pairs)
++                    with_mid = [(p, m, y) for p, m, y in pairs if m is not None]
++                    line = f"{label} ~{lead // 60}m left: n={len(pairs)} model {model:.3f}"
++                    if with_mid:
++                        same = statistics.mean((p - y) ** 2 for p, _, y in with_mid)
++                        mid = statistics.mean((m - y) ** 2 for _, m, y in with_mid)
++                        line += f" | same-rows model {same:.3f} vs Kalshi mid {mid:.3f} (n={len(with_mid)})"
++                    if len(pairs) < MIN_SAMPLE:
++                        line += f" [n<{MIN_SAMPLE}: too few]"
++                    out.append(line)
++            end, start, flips, checked = [], [], 0, 0
++            for kind, ev, strike, ps, pe, result in db.execute(
++                "SELECT strike_type,expiration_value,settle_strike,proxy_start,proxy_end,result FROM markets"
++                " WHERE result IN ('yes','no')"
++            ):
++                if ev is not None and pe is not None:
++                    end.append(pe - ev)
++                if strike is not None and ps is not None:
++                    start.append(ps - strike)
++                if strike is not None and pe is not None and kind:
++                    above = pe > strike if kind.startswith("greater") else pe < strike
++                    checked += 1
++                    flips += (("yes" if above else "no") != result)
++            out += ["", "Proxy minus Kalshi settlement values (basis):",
++                    "end   (proxy close vs expiration_value): " + self._stats(end),
++                    "start (proxy close vs floor_strike):     " + self._stats(start),
++                    f"Proxy end price on the wrong side of the strike vs official result: {flips}/{checked}"]
++            if total == 0 and not end:
++                out.append("No settled markets logged yet. Keep the bot running.")
++            return "\n".join(out)
++        except Exception as exc:
++            return f"Calibration unavailable: {exc}"
++
++    def export_csv(self, limit=50000):
++        db = self._db()
++        if db is None:
++            return "log unavailable\n"
++        buf = io.StringIO()
++        writer = csv.writer(buf)
++        writer.writerow(["ts", "ticker", "minutes", "spot", "strike", "seconds_left", "sigma_min", "p_yes",
++                         "momentum", "yes_bid", "yes_ask", "feed_age", "result", "expiration_value",
++                         "settle_strike", "proxy_start", "proxy_end"])
++        try:
++            writer.writerows(db.execute(
++                "SELECT f.ts,f.ticker,f.minutes,f.spot,f.strike,f.seconds_left,f.sigma_min,f.p_yes,f.momentum,"
++                "f.yes_bid,f.yes_ask,f.feed_age,m.result,m.expiration_value,m.settle_strike,m.proxy_start,"
++                "m.proxy_end FROM forecasts f LEFT JOIN markets m ON m.ticker=f.ticker ORDER BY f.id DESC LIMIT ?",
++                (limit,),
++            ))
++        except Exception as exc:
++            logger.warning("Forecast log export failed: %s", exc)
++        return buf.getvalue()
+diff -ruN supplied_original/free_gold.py updated/free_gold.py
+--- supplied_original/free_gold.py	2026-11-09 12:31:10.458280901 -0800
++++ updated/free_gold.py	2026-11-09 12:31:10.460042256 -0800
+@@ -7,10 +7,47 @@
+ import statistics
+ import time
+ from datetime import datetime,timezone
++from urllib.parse import quote
+ from aiohttp import web
++from forecast_log import ForecastLog,number
  
+ URL='https://api.gold-api.com/price/XAU'
+ MAX_AGE=float(os.getenv('GOLD_MAX_AGE_SECONDS','60'))
++# Model settings (all uncalibrated until /calibration has enough settled markets).
++VOL_FLOOR=float(os.getenv('GOLD_VOL_FLOOR','0.0001'))      # per-minute log-vol floor
++VOL_MULT=float(os.getenv('GOLD_VOL_MULT','1.1'))           # fat-tail inflation of measured vol
++BASIS_USD=float(os.getenv('GOLD_BASIS_USD','0.75'))        # 1-sigma proxy-vs-Pyth-index error, USD
++MOMENTUM_ALERTS=os.getenv('MOMENTUM_ALERTS','false').lower()=='true'
++GAP_RESET_SECONDS=300     # feed silent longer than this: discard candle history
++P_MIN,P_MAX=.02,.98       # never display certainty
++MAX_SECONDS={15:1200,60:4500}   # longer than this means the expiry field is wrong, not the market
++SERIES={15:'KXGOLD15M',60:'KXGOLDH'}
++
++def norm_cdf(x):return .5*(1+math.erf(x/math.sqrt(2)))
++
++def realized_vol(candles,tf,max_returns,min_returns,max_gap=3):
++    """RMS close-to-close log return per sqrt(minute). Tolerates missing candles (gap-normalised)."""
++    rets=[]
++    for a,b in zip(candles,candles[1:]):
++        dt=(b['timestamp']-a['timestamp'])/60
++        if 0<dt<=max_gap*tf/60 and a['close']>0 and b['close']>0:rets.append(math.log(b['close']/a['close'])/math.sqrt(dt))
++    rets=rets[-max_returns:]
++    if len(rets)<min_returns:return None
++    return math.sqrt(sum(r*r for r in rets)/len(rets))
++
++def price_at(candles,t,tolerance=120):
++    """Close of the last completed 1m candle ending at or before t (None if older than tolerance)."""
++    best=None
++    for c in candles:
++        if c['timestamp']+60<=t:best=c
++        else:break
++    return best['close'] if best and t-(best['timestamp']+60)<=tolerance else None
++
++def candle_close_at(candles,end):
++    """Close of the 1m candle that ENDS at `end` (Kalshi/Pyth label candles by their opening minute)."""
++    for c in candles:
++        if c['timestamp']==int(end)-60:return c['close']
++    return None
+ 
+ def stamp(value):
+     dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+@@ -25,7 +62,8 @@
+     return f'− [{left}│{right}] + {value:+.0f}'
+ 
+ def expiry(m):
+-    for field in ('expected_expiration_time','expiration_time','close_time'):
++    # expiration_time is Kalshi's LATEST possible expiry (hours after the window on 15m gold), so it is last resort.
++    for field in ('expected_expiration_time','close_time','expiration_time'):
+         try:return stamp(m[field])
+         except (KeyError,TypeError,ValueError):pass
+     return None
+@@ -50,6 +88,8 @@
+         self.rows=[];self.updated=0.;self.status='Waiting for free gold feed'
+         self.muted=False;self.threshold=65.;self.last_alert=0.;self.armed=True
+         self.contexts={}
++        self.log=ForecastLog(os.getenv('FORECAST_DB','forecast_log.db'))
++        self.min_seconds={15:210,60:600};self.series_info={};self.series_loaded=0.
+ 
+     def fresh(self):
+         return self.price is not None and -5<=time.time()-self.publish_time<=MAX_AGE and time.time()-self.received<=MAX_AGE
+@@ -68,7 +108,7 @@
+                 r.raise_for_status();data=await r.json()
+             price,ts=self.decode(data)
+             if ts>self.publish_time:
+-                if self.previous_ts and ts-self.previous_ts>120:
++                if self.previous_ts and ts-self.previous_ts>GAP_RESET_SECONDS:
+                     state.candles_1m=type(state.candles_1m)(60,max_candles=120)
+                     state.candles_5m=type(state.candles_5m)(300,max_candles=120)
+                 state.candles_1m.update(price,ts);state.candles_5m.update(price,ts)
+@@ -83,55 +123,105 @@
+             return None
+ 
+     def model(self,state,minutes):
+-        candles=list(state.candles_1m.candles)[-60:]
+-        if not self.fresh() or len(candles)<20:return None
+-        if any(b['timestamp']-a['timestamp']!=60 for a,b in zip(candles,candles[1:])):return None
+-        returns=[math.log(c['close']/c['open']) for c in candles]
+-        vol=max(statistics.pstdev(returns),1e-7);n=min(minutes,len(candles))
+-        delta=math.log(self.price/candles[-n]['open'])
+-        return 100*math.tanh(delta/(2*vol*math.sqrt(n))),statistics.mean(returns[-10:]),vol
++        """Zero-drift inputs for one timeframe: per-minute volatility and a display-only momentum gauge.
++        15m uses 1m candles; 1h uses its own 5m candles (falls back to 1m while 5m history warms up)."""
++        if not self.fresh():return None
++        one=list(state.candles_1m.candles);fallback=False
++        if minutes>=60:
++            sigma=realized_vol(list(state.candles_5m.candles),300,48,12)
++            if sigma is None:sigma=realized_vol(one,60,60,20);fallback=True
++        else:sigma=realized_vol(one,60,60,20)
++        if sigma is None:return None
++        sigma=max(sigma,VOL_FLOOR)*VOL_MULT
++        ref=price_at(one,self.publish_time-minutes*60)   # None until a full lookback of history exists
++        momentum=100*math.tanh(math.log(self.price/ref)/(2*sigma*math.sqrt(minutes))) if ref else None
++        return dict(sigma=sigma,momentum=momentum,fallback=fallback)
++
++    def probability(self,spot,strike,kind,seconds,sigma):
++        """P(YES) for a fixed strike: zero drift, plus uncertainty for proxy-vs-index basis. Clamped, uncalibrated."""
++        horizon=max(seconds,1)/60;basis=BASIS_USD/spot
++        total=math.sqrt(sigma*sigma*horizon+basis*basis)
++        p=norm_cdf((math.log(spot/strike)-sigma*sigma*horizon/2)/total)
++        if str(kind).startswith('less'):p=1-p
++        return min(P_MAX,max(P_MIN,p))
++
++    async def load_series(self,session,bot):
++        """Fetch settlement source / fee terms from Kalshi (public). Shown by /source; fee multiplier feeds edge maths."""
++        if time.time()-self.series_loaded<6*3600:return
++        self.series_loaded=time.time();failed=False
++        for series in SERIES.values():
++            try:
++                async with session.get(f'{bot.KALSHI_BASE_URL}/series/{quote(series,safe="")}',timeout=6) as r:
++                    r.raise_for_status();data=(await r.json()).get('series',{})
++                self.series_info[series]=dict(title=data.get('title'),sources=data.get('settlement_sources'),
++                    terms=data.get('contract_terms_url'),fee_type=data.get('fee_type'),fee_multiplier=data.get('fee_multiplier'))
++            except Exception as exc:
++                failed=True;self.series_info[series]=dict(error=str(exc)[:120])
++        if failed:self.series_loaded=time.time()-6*3600+300   # retry in 5 minutes
++        info=self.series_info.get('KXGOLD15M',{});mult=number(info.get('fee_multiplier'))
++        if str(info.get('fee_type') or '').startswith('quadratic') and mult and mult>0:bot.FEE_RATE=.07*mult
+ 
+     async def refresh(self,session,bot):
+         markets=await bot.fetch_kalshi_gold_markets(session);bot.STATE.active_markets_count=len(markets)
++        self.min_seconds={15:int(getattr(bot,'MIN_MINUTES_15M',3.5)*60),60:int(getattr(bot,'MIN_MINUTES_1H',10)*60)}
++        await self.load_series(session,bot)
+         rows=[];now=time.time()
+-        for minutes,series in ((15,'KXGOLD15M'),(60,'KXGOLDH')):
++        for minutes,series in SERIES.items():
+             market=select_one(markets,series,now,self.price);model=self.model(bot.STATE,minutes)
+             end=expiry(market) if market else None
+             row=dict(minutes=minutes,ticker=market.get('ticker') if market else None,
+-                momentum=model[0] if model else None,projected_price=None,prediction=None,
+-                yes_score=None,target=None,seconds_left=max(0,int(end-now)) if end else None,
+-                reason='',quotes=None,updated_at=now)
++                momentum=model['momentum'] if model else None,sigma_usd=None,prediction=None,
++                yes_score=None,target=None,kind=market.get('strike_type') if market else None,
++                seconds_left=max(0,int(end-now)) if end else None,reason='',quotes=None,updated_at=now)
+             if not market:row['reason']='No active contract found'
+-            elif not model:row['reason']='Warm-up (20 minute candles), stale feed or history gap'
++            elif end is None:row['reason']='Contract has no usable expiry time'
++            elif end-now>MAX_SECONDS[minutes]:row['reason']='Expiry time implausible; forecast withheld'
++            elif not model:row['reason']='Warm-up (about 20 min of candles; hourly needs 1 h), stale feed or outage'
+             else:
+-                horizon=(end-now)/60;g,drift,vol=model
+-                projected=self.price*math.exp(max(-.1,min(.1,drift*horizon)))
+-                row['projected_price']=projected
+-                if minutes==15:
+-                    strike=bot.parse_strike(market);kind=market.get('strike_type');row['target']=strike
+-                    if strike and kind in ('greater','greater_or_equal','less','less_or_equal'):
+-                        p=.5*(1+math.erf(math.log(projected/strike)/(vol*math.sqrt(horizon)*math.sqrt(2))))
+-                        if kind.startswith('less'):p=1-p
+-                        row['yes_score']=round(p*100,1);row['prediction']='YES' if p>=.5 else 'NO'
+-                    else:row['reason']='Missing structured target/direction; YES/NO unavailable'
+-            if market and minutes==15:row['quotes']=await bot.fetch_orderbook_details(session,market['ticker'])
++                seconds=end-now;strike=bot.parse_strike(market);kind=market.get('strike_type');row['target']=strike
++                row['sigma_usd']=round(self.price*model['sigma']*math.sqrt(max(seconds,1)/60),2)
++                if strike and kind in ('greater','greater_or_equal','less','less_or_equal'):
++                    p=self.probability(self.price,strike,kind,seconds,model['sigma'])
++                    row['yes_score']=round(p*100,1);row['prediction']='YES' if p>=.5 else 'NO'
++                    if model['fallback']:row['reason']='Hourly volatility from 1m candles (5m history warming up)'
++                else:row['reason']='Missing structured target/direction; YES/NO unavailable'
++            if market:row['quotes']=await bot.fetch_orderbook_details(session,market['ticker'])
+             rows.append(row)
++            if market and end is not None:
++                age=now-self.publish_time if self.publish_time else None
++                self.log.record(market,row,model['sigma'] if model else None,self.price,age,now,end)
+         self.rows=rows;self.updated=now
+         self.contexts={k:v for k,v in self.contexts.items() if now-v['created']<1800}
+         if len(self.contexts)>2000:
+             for key in sorted(self.contexts,key=lambda k:self.contexts[k]['created'])[:-2000]:self.contexts.pop(key,None)
+ 
++    async def settle(self,session,bot):
++        """Record Kalshi's official result + expiration_value for finished markets, with our proxy's candle closes."""
++        now=time.time();candles=list(bot.STATE.candles_1m.candles)
++        for ticker,minutes,end_ts in self.log.pending(now):
++            try:
++                async with session.get(f'{bot.KALSHI_BASE_URL}/markets/{quote(ticker,safe="")}',timeout=5) as r:
++                    if r.status!=200:continue
++                    market=(await r.json()).get('market',{})
++            except Exception:continue
++            result=(market.get('result') or '').lower()
++            if result not in ('yes','no'):continue          # official result not published yet
++            window=900 if minutes==15 else 3600
++            self.log.settle(ticker,result,number(market.get('expiration_value')),
++                number(market.get('floor_strike') or market.get('cap_strike')),
++                candle_close_at(candles,end_ts-window),candle_close_at(candles,end_ts),now)
++
+     def snapshot(self):
+         rows=[]
+         for original in self.rows:
+             row=dict(original);seconds=row['seconds_left']
+             if not self.fresh() or time.time()-self.updated>45 or (seconds is not None and time.time()-self.updated>=seconds):
+-                row.update(momentum=None,projected_price=None,prediction=None,yes_score=None,reason='Stale/unavailable data')
++                row.update(momentum=None,sigma_usd=None,prediction=None,yes_score=None,reason='Stale/unavailable data')
+             elif seconds is not None:row['seconds_left']=max(0,seconds-int(time.time()-self.updated))
+             rows.append(row)
+         return dict(provider='Gold-API.com',status=self.status,fresh=self.fresh(),price=self.price,
+             quote_age=round(time.time()-self.publish_time,1) if self.publish_time else None,
+-            proxy_warning='Not exact Pyth settlement index. Uncalibrated scores. Kalshi supplies official results.',
++            proxy_warning='Not exact Pyth settlement index. Zero-drift model, uncalibrated until /calibration has data. Kalshi supplies official results.',
+             muted=self.muted,threshold=self.threshold,markets=rows)
+ 
+     def report(self):
+@@ -141,20 +231,22 @@
+             row=next((r for r in snap['markets'] if r['minutes']==minutes),None)
+             lines+=['',f'<b>{"15-MINUTE" if minutes==15 else "1-HOUR"} MARKET</b>']
+             if not row:lines+=['Waiting for first scan'];continue
+-            price=f"${row['projected_price']:,.2f}" if row['projected_price'] is not None else 'unavailable'
+-            lines+=[f'<b>Projected finish:</b> {price}',f'<code>{gauge(row["momentum"])}</code>']
+-            if minutes==15:
+-                if row['target'] is not None:lines+=[f'<b>Target:</b> ${row["target"]:,.2f}']
+-                prediction=row['prediction'] or 'unavailable';lines+=[f'<b>Model prediction:</b> {prediction}']
+-                if row['yes_score'] is not None:
+-                    score=row['yes_score'] if prediction=='YES' else 100-row['yes_score']
+-                    lines+=[f'<b>Model score for {prediction}:</b> {score:.1f}/100']
+-                if row['ticker']:lines+=[f'<b>Contract:</b> <code>{html.escape(row["ticker"])}</code>']
++            if row['target'] is not None:
++                word='above' if str(row['kind']).startswith('greater') else 'below' if str(row['kind']).startswith('less') else ''
++                lines+=[f'<b>Target:</b> ${row["target"]:,.2f}'+(f' (YES if finish {word})' if word else '')]
++            prediction=row['prediction'] or 'unavailable';lines+=[f'<b>Model prediction:</b> {prediction}']
++            if row['yes_score'] is not None:
++                score=row['yes_score'] if prediction=='YES' else 100-row['yes_score']
++                lines+=[f'<b>Model score for {prediction}:</b> {score:.1f}/100']
++            if row['sigma_usd'] is not None:lines+=[f'<b>Typical move to finish (1σ):</b> ±${row["sigma_usd"]:,.2f}']
++            lines+=[f'<code>{gauge(row["momentum"])}</code> momentum (display only)']
++            if row['ticker']:lines+=[f'<b>Contract:</b> <code>{html.escape(row["ticker"])}</code>']
+             seconds=row['seconds_left']
+             if seconds is not None:lines+=[f'<b>Time remaining:</b> {seconds//60}m {seconds%60:02d}s']
++            if seconds is not None and seconds<self.min_seconds[minutes]:lines+=['Final minutes: proxy-vs-Pyth difference dominates; low confidence.']
+             if row['reason']:lines+=[html.escape(row['reason'])]
+-        lines+=['','<i>Free spot proxy—not exact Pyth settlement. Scores uncalibrated.</i>',
+-                'Choose YES or NO below to enable buys. Model prediction does not choose your purchase side.']
++        lines+=['','<i>Free spot proxy—not exact Pyth settlement. Zero-drift model; scores uncalibrated (see /calibration).</i>',
++                'Only the 15-minute market is tradable. Choose YES or NO below to enable buys. Model prediction does not choose your purchase side.']
+         return '\n'.join(lines)
+ 
+     def new_context(self,ticker,side=None,ask=None,held=None,parent=None):
+@@ -252,7 +344,7 @@
+         strength=max((abs(r['momentum']) for r in self.rows if r['momentum'] is not None),default=0)
+         if strength<self.threshold-10:self.armed=True
+         reversal=False;row=next((r for r in self.rows if r['minutes']==15),None)
+-        if row and row['prediction'] and row['yes_score'] is not None and row['quotes']:
++        if row and row['prediction'] and row['yes_score'] is not None and row['quotes'] and (row['seconds_left'] or 0)>=self.min_seconds[15]:
+             sig=bot.detect_reversal_signal(bot.STATE.candles_1m,'1m')
+             if sig['direction']=='NEUTRAL':sig=bot.detect_reversal_signal(bot.STATE.candles_5m,'5m')
+             side='YES' if sig['direction']=='BULLISH' else 'NO' if sig['direction']=='BEARISH' else None
+@@ -262,7 +354,7 @@
+                 edge=fair-ask-bot.kalshi_taker_fee_cents(ask);reversal=edge>=bot.MIN_NET_EDGE_CENTS and 8<=ask<=85
+         now=time.time()
+         if now-self.last_alert<bot.ALERT_COOLDOWN_SECONDS:return
+-        if not ((strength>=self.threshold and self.armed) or reversal):return
++        if not ((MOMENTUM_ALERTS and strength>=self.threshold and self.armed) or reversal):return
+         self.last_alert=now;self.armed=False
+         await self.send_prediction(session,bot,refresh=False)
+         if reversal:
+@@ -283,10 +375,14 @@
+             except (IndexError,ValueError):return 'Usage: threshold 10–95'
+         if cmd=='feed':return f'{self.status}; fresh={self.fresh()}; age={self.snapshot()["quote_age"]}s; spot proxy only'
+         if cmd=='gauge':return '\n'.join(f'{r["minutes"]}m {gauge(r["momentum"])}' for r in self.snapshot()['markets']) or 'Waiting for scan'
++        if cmd=='calibration':return self.log.calibration()
++        if cmd=='source':
++            if not self.series_info:return 'Series info not loaded yet; wait for the next scan.'
++            return '\n'.join(f'{k}: '+(info['error'] if 'error' in info else f'{info.get("title")}; sources={info.get("sources")}; terms={info.get("terms")}; fee={info.get("fee_type")} x{info.get("fee_multiplier")}') for k,info in self.series_info.items())
+         if cmd in ('predict','status'):
+             import re
+             return html.unescape(re.sub('<[^>]+>','',self.report()))
+-        return '/predict /gauge /feed /mute /unmute /threshold 65 /status /stats /balance /markets'
++        return '/predict /gauge /feed /calibration /source /mute /unmute /threshold 65 /status /stats /balance /markets'
+ 
+ MONITOR=GoldMonitor()
+ 
+@@ -305,11 +401,11 @@
+ 
+ HTML=r"""<!doctype html><meta charset=utf-8><title>Gold forecasts</title><style>body{font:16px system-ui;background:#14202e;color:#eee;max-width:900px;margin:30px auto;padding:15px}pre{white-space:pre-wrap}article{background:#25374a;padding:18px;margin:15px 0}.g{position:relative;width:240px;height:18px;border:1px solid #aaa}.center{position:absolute;left:50%;height:100%;border-left:1px solid white}.fill{position:absolute;height:100%}input,button{padding:8px}</style><h1>Gold finish forecast</h1><p>Free spot proxy. Official settlement from Kalshi. Trade controls are Telegram-only.</p><p id=status></p><div id=rows></div><form id=f><input id=cmd placeholder="predict / gauge / feed"><button>Command</button></form><pre id=reply></pre><script>
+ const $=s=>document.querySelector(s);const token=sessionStorage.getItem('gold_token')||prompt('Dashboard token')||'';sessionStorage.setItem('gold_token',token);const headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'};function esc(x){let e=document.createElement('span');e.textContent=x??'unavailable';return e.innerHTML;}
+-async function update(){try{let r=await fetch('/api/gold',{headers});if(!r.ok)throw Error(r.status);let s=await r.json();$('#status').textContent=s.status+' | spot '+s.price+' | age '+s.quote_age+'s';$('#rows').innerHTML=s.markets.map(m=>{let g=m.momentum||0,w=Math.abs(g)/2,left=g<0?50-w:50;return `<article><h2>${m.minutes===15?'15-minute':'1-hour'}</h2><p>Projected finish: ${esc(m.projected_price)}</p><div class=g><span class=fill style="left:${left}%;width:${w}%;background:${g<0?'#d66':'#5b8'}"></span><span class=center></span></div><p>−100 ← ${esc(m.momentum)} → +100</p>${m.minutes===15?`<p>Target: ${esc(m.target)} | model prediction: ${esc(m.prediction)}</p>`:''}<p>Seconds remaining: ${esc(m.seconds_left)}</p><p>${esc(m.reason)}</p></article>`}).join('');}catch(e){$('#status').textContent='Disconnected: '+e.message;}}$('#f').onsubmit=async e=>{e.preventDefault();let r=await fetch('/api/command',{method:'POST',headers,body:JSON.stringify({command:$('#cmd').value})});$('#reply').textContent=await r.text();};update();setInterval(update,2000);</script>"""
++async function update(){try{let r=await fetch('/api/gold',{headers});if(!r.ok)throw Error(r.status);let s=await r.json();$('#status').textContent=s.status+' | spot '+s.price+' | age '+s.quote_age+'s';$('#rows').innerHTML=s.markets.map(m=>{let g=m.momentum||0,w=Math.abs(g)/2,left=g<0?50-w:50;return `<article><h2>${m.minutes===15?'15-minute':'1-hour'}</h2><p>Typical move to finish (1σ): ±${esc(m.sigma_usd)}</p><div class=g><span class=fill style="left:${left}%;width:${w}%;background:${g<0?'#d66':'#5b8'}"></span><span class=center></span></div><p>−100 ← ${esc(m.momentum)} → +100 (momentum, display only)</p><p>Target: ${esc(m.target)} | model prediction: ${esc(m.prediction)} (YES ${esc(m.yes_score)}/100)</p><p>Seconds remaining: ${esc(m.seconds_left)}</p><p>${esc(m.reason)}</p></article>`}).join('');}catch(e){$('#status').textContent='Disconnected: '+e.message;}}$('#f').onsubmit=async e=>{e.preventDefault();let r=await fetch('/api/command',{method:'POST',headers,body:JSON.stringify({command:$('#cmd').value})});$('#reply').textContent=await r.text();};update();setInterval(update,2000);</script>"""
+ 
+ @web.middleware
+ async def dashboard_auth(request,handler):
+-    if request.path not in ('/dashboard','/api/gold','/api/command'):return await handler(request)
++    if request.path not in ('/dashboard','/api/gold','/api/command','/api/log'):return await handler(request)
+     import hmac
+     token=os.getenv('DASHBOARD_TOKEN','')
+     if token:
+@@ -320,6 +416,7 @@
+         if origin and origin!=f'{request.scheme}://{request.host}':raise web.HTTPForbidden()
+     return await handler(request)
+ async def dashboard(request):return web.Response(text=HTML,content_type='text/html')
++async def log_api(request):return web.Response(text=MONITOR.log.export_csv(),content_type='text/csv',headers={'Cache-Control':'no-store'})
+ async def state_api(request):return web.json_response(MONITOR.snapshot(),headers={'Cache-Control':'no-store'})
+ async def command_api(request):
+     try:
+diff -ruN supplied_original/test_update.py updated/test_update.py
+--- supplied_original/test_update.py	2026-11-09 12:31:10.458329261 -0800
++++ updated/test_update.py	2026-11-09 12:31:10.460067417 -0800
+@@ -1,12 +1,17 @@
+ import asyncio
+ import os
++import warnings
++warnings.filterwarnings('ignore',category=ResourceWarning)   # in-memory test DBs are never closed
++os.environ['FORECAST_DB']=':memory:'
+ import time
+ import unittest
+ from datetime import datetime,timezone
+ from decimal import Decimal as D
+ from types import SimpleNamespace
+ from unittest.mock import AsyncMock,patch
+-from free_gold import GoldMonitor,gauge
++import free_gold
++from free_gold import GoldMonitor,gauge,realized_vol,price_at,expiry
++from forecast_log import ForecastLog
+ from trade_controls import Execution
+ 
+ T='KXGOLD15M-26NOV09-A';H='KXGOLDH-26NOV09-B'
+@@ -23,6 +28,28 @@
+     return SimpleNamespace(ENABLE_LIVE_ORDERS=True,KALSHI_KEY_ID='mock',PRIVATE_KEY_OBJ=object(),
+         KALSHI_API_PREFIX='/trade-api/v2',KALSHI_HOST='https://mock.invalid',MONITOR=SimpleNamespace(fresh=lambda:True))
+ 
++def candles(closes,end,tf=60):
++    """Completed candles; the last one ends at `end`."""
++    n=len(closes);out=[];prev=closes[0]
++    for i,c in enumerate(closes):
++        out.append(dict(timestamp=end-tf*(n-i),open=prev,high=max(prev,c),low=min(prev,c),close=c));prev=c
++    return out
++
++class FakeResp:
++    def __init__(s,data,status=200):s.data=data;s.status=status
++    async def json(s):return s.data
++    def raise_for_status(s):
++        if s.status>=400:raise RuntimeError(s.status)
++    async def __aenter__(s):return s
++    async def __aexit__(s,*a):return False
++class FakeSession:
++    def __init__(s,routes):s.routes=routes;s.calls=[]
++    def get(s,url,**kw):
++        s.calls.append(url)
++        for key,data in s.routes.items():
++            if key in url:return FakeResp(data)
++        return FakeResp({},404)
++
+ class TradeTests(unittest.IsolatedAsyncioTestCase):
+     def execution(self,responses):
+         e=Execution(bot_stub());e.request=AsyncMock(side_effect=responses);return e
+@@ -173,15 +200,62 @@
+ 
+ class ForecastTests(unittest.IsolatedAsyncioTestCase):
+     async def test_one_forecast_per_timeframe(self):
+-        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time();g.model=lambda state,minutes:(63,.00001,.001)
+-        markets=[market()]
++        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time()
++        g.model=lambda state,minutes:dict(sigma=.0003 if minutes==15 else .0004,momentum=63 if minutes==15 else -20,fallback=False)
++        markets=[market()];close=stamp(1800)      # one shared expiry string, as on a real hourly ladder
+         for i in range(20):
+-            m=market(H+str(i));m.update(series_ticker='KXGOLDH',floor_strike=3900+10*i,expiration_time=stamp(1800));markets.append(m)
++            m=market(H+str(i));m.update(series_ticker='KXGOLDH',floor_strike=3900+10*i,expiration_time=close,close_time=close);markets.append(m)
+         b=SimpleNamespace(STATE=SimpleNamespace(active_markets_count=0),fetch_kalshi_gold_markets=AsyncMock(return_value=markets),
+             fetch_orderbook_details=AsyncMock(return_value={'yes_ask':45,'no_ask':58,'spread':3}),parse_strike=lambda m:float(m['floor_strike']))
+-        await g.refresh(None,b);self.assertEqual(len(g.rows),2);self.assertIsNone(g.rows[1]['yes_score'])
+-        report=g.report();self.assertEqual(report.count('Projected finish:'),2)
+-        hour=report.split('<b>1-HOUR MARKET</b>')[1].split('<i>')[0];self.assertNotIn('Model prediction:',hour)
++        await g.refresh(None,b);self.assertEqual(len(g.rows),2)
++        hour=g.rows[1];self.assertEqual(hour['target'],4000.0)          # nearest hourly strike to spot, never the whole ladder
++        self.assertIsNotNone(hour['yes_score']);self.assertIn(hour['prediction'],('YES','NO'))
++        self.assertNotEqual(g.rows[0]['sigma_usd'],hour['sigma_usd'])    # own vol window and time left
++        report=g.report();self.assertEqual(report.count('Model prediction:'),2);self.assertEqual(report.count('Typical move to finish'),2)
++        self.assertNotIn('Projected finish',report)
++
++    async def test_probability_zero_drift_and_clamped(self):
++        g=GoldMonitor()
++        self.assertAlmostEqual(g.probability(4000,4000,'greater',600,.0003),.5,delta=.01)
++        near=g.probability(4001,4000,'greater',60,.0003);far=g.probability(4001,4000,'greater',600,.0003)
++        self.assertGreater(near,far);self.assertGreater(far,.5)
++        self.assertAlmostEqual(g.probability(4003,4000,'less',300,.0003),1-g.probability(4003,4000,'greater',300,.0003),places=6)
++        self.assertEqual(g.probability(4100,4000,'greater',60,.0003),free_gold.P_MAX)
++        self.assertEqual(g.probability(3900,4000,'greater',60,.0003),free_gold.P_MIN)
++    async def test_basis_uncertainty_limits_confidence(self):
++        g=GoldMonitor()
++        with patch.object(free_gold,'BASIS_USD',0.01):tight=g.probability(4001,4000,'greater',30,.0001)
++        with patch.object(free_gold,'BASIS_USD',2.0):loose=g.probability(4001,4000,'greater',30,.0001)
++        self.assertGreater(tight,loose)
++    async def test_trend_does_not_move_probability(self):
++        g=GoldMonitor();now=time.time();g.publish_time=g.received=now-1;e=int(g.publish_time//60)*60
++        closes=[3990+i*.15 for i in range(70)];g.price=closes[-1]
++        st=SimpleNamespace(candles_1m=SimpleNamespace(candles=candles(closes,e)),candles_5m=SimpleNamespace(candles=[]))
++        m=g.model(st,15);self.assertGreater(m['momentum'],50)          # strong uptrend shows on the gauge ...
++        p=g.probability(g.price,g.price,'greater',600,m['sigma'])
++        self.assertAlmostEqual(p,.5,delta=.02)                         # ... but never biases the probability
++    async def test_vol_close_to_close_and_gap_tolerant(self):
++        closes=[4000*(1+.0002*(-1)**i) for i in range(40)]
++        c=candles(closes,1_800_000_000);self.assertAlmostEqual(realized_vol(c,60,60,20),.0004,delta=.0001)
++        gap=c[:20]+c[21:];self.assertIsNotNone(realized_vol(gap,60,60,20))   # one missing minute no longer blanks the model
++    async def test_gap_does_not_blank_model_or_hourly_lookback_warmup(self):
++        g=GoldMonitor();now=time.time();g.publish_time=g.received=now-1;e=int(g.publish_time//60)*60
++        closes=[4000+(i%5)*.3 for i in range(70)];cs=candles(closes,e);del cs[30]
++        g.price=closes[-1];st=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs),candles_5m=SimpleNamespace(candles=[]))
++        m15=g.model(st,15);self.assertIsNotNone(m15);self.assertIsNotNone(m15['momentum'])
++        short=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs[-30:]),candles_5m=SimpleNamespace(candles=[]))
++        self.assertIsNotNone(g.model(short,15)['momentum']);self.assertIsNone(g.model(short,60)['momentum'])  # no fake 1h gauge from 30 min
++        self.assertTrue(g.model(st,60)['fallback'])
++    async def test_expiry_prefers_close_time_over_latest_expiration(self):
++        m=market();m['expiration_time']=stamp(6*3600);m.pop('expected_expiration_time',None)
++        self.assertLess(expiry(m)-time.time(),700)
++    async def test_implausible_expiry_withheld(self):
++        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time()
++        g.model=lambda state,minutes:dict(sigma=.0003,momentum=0,fallback=False)
++        m=market();m['close_time']=m['expiration_time']=stamp(5*3600)
++        b=SimpleNamespace(STATE=SimpleNamespace(active_markets_count=0),fetch_kalshi_gold_markets=AsyncMock(return_value=[m]),
++            fetch_orderbook_details=AsyncMock(return_value=None),parse_strike=lambda m:4000.)
++        await g.refresh(None,b);self.assertIsNone(g.rows[0]['yes_score']);self.assertIn('implausible',g.rows[0]['reason'])
+     async def test_positive_gauge(self):self.assertIn('░'*8+'│'+'█'*5,gauge(63))
+     async def test_negative_gauge(self):self.assertIn('░'*3+'█'*5+'│'+'░'*8,gauge(-63))
+     async def test_stale_feed(self):
+@@ -192,6 +266,73 @@
+         with self.assertRaises(ValueError):GoldMonitor().decode(dict(symbol='XAG',price=4000,updatedAt=stamp(0)))
+     async def test_nan_threshold(self):self.assertIn('Usage',GoldMonitor().command('threshold nan'))
+ 
++class LogTests(unittest.IsolatedAsyncioTestCase):
++    def row(self,ticker,minutes=15,p=70.,left=300,bid=60,ask=64):
++        return dict(minutes=minutes,ticker=ticker,target=4000.,yes_score=p,seconds_left=left,momentum=10,quotes=dict(yes_bid=bid,yes_ask=ask))
++    def mk(self,ticker,end,**kw):
++        return dict(ticker=ticker,strike_type='greater',close_time=stamp(0),expected_expiration_time=stamp(0),expiration_time=stamp(0))
++    async def test_settle_records_official_result_value_and_proxy_basis(self):
++        g=GoldMonitor();end=int(time.time()//60)*60-120
++        g.log.record(self.mk('KXGOLD15M-X',end),self.row('KXGOLD15M-X'),.0003,4001.,2.,time.time()-400,end)
++        # candle ENDING at `end` (timestamp end-60) closes 4001.00; candle ending at end-900 closes 3999.50
++        cs=[dict(timestamp=end-960,open=1,high=1,low=1,close=3999.5),dict(timestamp=end-60,open=1,high=1,low=1,close=4001.0)]
++        bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2',STATE=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs)))
++        sess=FakeSession({'/markets/KXGOLD15M-X':{'market':dict(result='yes',expiration_value='4000.40',floor_strike=3999.9)}})
++        await g.settle(sess,bot)
++        row=g.log.db.execute('SELECT result,expiration_value,settle_strike,proxy_start,proxy_end FROM markets').fetchone()
++        self.assertEqual(row,('yes',4000.4,3999.9,3999.5,4001.0))
++        await g.settle(sess,bot);self.assertEqual(len(sess.calls),1)           # settled markets are not polled again
++        text=g.log.calibration();self.assertIn('+0.60',text);self.assertIn('wrong side of the strike vs official result: 0/1',text)
++    async def test_unpublished_result_stays_pending(self):
++        g=GoldMonitor();end=int(time.time())-120
++        g.log.record(self.mk('KXGOLD15M-Y',end),self.row('KXGOLD15M-Y'),.0003,4001.,2.,time.time()-400,end)
++        bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2',STATE=SimpleNamespace(candles_1m=SimpleNamespace(candles=[])))
++        await g.settle(FakeSession({'/markets/KXGOLD15M-Y':{'market':dict(result='',status='closed')}}),bot)
++        self.assertEqual(len(g.log.pending(time.time())),1)
++    async def test_calibration_brier_vs_kalshi_mid(self):
++        log=ForecastLog(':memory:');now=time.time()
++        for i in range(40):
++            t=f'KXGOLD15M-{i}';end=now-1000-i*900;y='yes' if i%2==0 else 'no'
++            log.record(self.mk(t,end),self.row(t,p=80.,left=300,bid=58,ask=62),.0003,4000.,1.,end-300,end)
++            log.settle(t,y,4000.,4000.,None,None,now)
++        text=log.calibration()
++        self.assertIn('n=40 model 0.340',text)                 # mean((0.8-y)^2)=(0.04+0.64)/2
++        self.assertIn('Kalshi mid 0.260',text)                 # mean((0.6-y)^2)=(0.16+0.36)/2
++    async def test_rows_without_probability_not_logged_and_throttled(self):
++        log=ForecastLog(':memory:');now=time.time();end=now+300
++        log.record(self.mk('T',end),dict(self.row('T'),yes_score=None),.0003,4000.,1.,now,end)
++        log.record(self.mk('T',end),self.row('T'),.0003,4000.,1.,now,end);log.record(self.mk('T',end),self.row('T'),.0003,4000.,1.,now+5,end)
++        self.assertEqual(log.db.execute('SELECT COUNT(*) FROM forecasts').fetchone()[0],1)
++        self.assertIn('ticker,',log.export_csv().splitlines()[0])
++    async def test_log_failure_never_raises(self):
++        log=ForecastLog('/nonexistent-dir/x.db');log.record(self.mk('T',1),self.row('T'),.0003,4000.,1.,1.,1.)
++        self.assertEqual(log.pending(time.time()),[]);self.assertIn('unavailable',log.calibration())
++    async def test_series_terms_and_fee_multiplier(self):
++        g=GoldMonitor();bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2')
++        info={'series':dict(title='Gold 15m',settlement_sources=[dict(name='Pyth',url='u')],contract_terms_url='t',fee_type='quadratic',fee_multiplier=.5)}
++        await g.load_series(FakeSession({'/series/':info}),bot)
++        self.assertAlmostEqual(bot.FEE_RATE,.035);self.assertIn('Pyth',g.command('source'))
++    async def test_series_failure_does_not_break_refresh(self):
++        g=GoldMonitor();await g.load_series(FakeSession({}),SimpleNamespace(KALSHI_BASE_URL='https://x'))
++        self.assertIn('KXGOLD15M: 404',g.command('source'));self.assertGreater(time.time()-g.series_loaded,5.9*3600)  # retry soon, not in 6 h
++
++class AlertTests(unittest.IsolatedAsyncioTestCase):
++    def setup(self,left,momentum=0):
++        g=GoldMonitor();g.price=4000;g.received=g.publish_time=time.time();g.send_prediction=AsyncMock();g.min_seconds={15:210,60:600}
++        g.rows=[dict(minutes=15,ticker=T,prediction='YES',yes_score=90.,target=4000.,seconds_left=left,momentum=momentum,quotes=dict(yes_ask=50,no_ask=52,spread=3)),
++                dict(minutes=60,ticker=H,prediction=None,yes_score=None,target=None,seconds_left=1800,momentum=momentum,quotes=None)]
++        b=SimpleNamespace(MAX_SPREAD_CENTS=12,MIN_NET_EDGE_CENTS=6,ALERT_COOLDOWN_SECONDS=300,kalshi_taker_fee_cents=lambda a:1.75,
++            detect_reversal_signal=lambda cb,label:dict(direction='BULLISH'),STATE=SimpleNamespace(candles_1m=None,candles_5m=None,tracker=SimpleNamespace(log_signal=lambda *a:None)))
++        return g,b
++    async def test_reversal_alert_fires_with_time_left(self):
++        g,b=self.setup(400);await g.maybe_alert(None,b);g.send_prediction.assert_awaited_once()
++    async def test_no_alert_in_final_minutes(self):
++        g,b=self.setup(100);await g.maybe_alert(None,b);g.send_prediction.assert_not_awaited()
++    async def test_momentum_alerts_off_by_default(self):
++        g,b=self.setup(100,momentum=95);await g.maybe_alert(None,b);g.send_prediction.assert_not_awaited()
++        with patch.object(free_gold,'MOMENTUM_ALERTS',True):await g.maybe_alert(None,b)
++        g.send_prediction.assert_awaited_once()
++
+ class HTTPTests(unittest.IsolatedAsyncioTestCase):
+     async def test_sell_http_local_mock(self):
+         import aiohttp
+@@ -228,6 +369,18 @@
+                     headers={'Authorization':'Bearer test-secret'}
+                     async with session.get(server.make_url('/api/gold'),headers=headers) as r:self.assertEqual(r.status,200)
+                     async with session.post(server.make_url('/api/command'),headers=headers,json={'command':'help'}) as r:self.assertEqual(r.status,200)
++    async def test_log_endpoint_requires_token(self):
++        import aiohttp
++        from aiohttp import web
++        from aiohttp.test_utils import TestServer
++        from free_gold import dashboard_auth,log_api
++        with patch.dict(os.environ,{'DASHBOARD_TOKEN':'test-secret'}):
++            app=web.Application(middlewares=[dashboard_auth]);app.router.add_get('/api/log',log_api)
++            async with TestServer(app) as server:
++                async with aiohttp.ClientSession() as session:
++                    async with session.get(server.make_url('/api/log')) as r:self.assertEqual(r.status,401)
++                    async with session.get(server.make_url('/api/log'),headers={'Authorization':'Bearer test-secret'}) as r:
++                        self.assertEqual(r.status,200);self.assertIn('ticker',await r.text())
+     async def test_integrated_bot(self):
+         import bot
+         app=bot.create_app();self.assertIn('/dashboard',[r.resource.canonical for r in app.router.routes()])
