@@ -1,0 +1,42 @@
+test_duplicate_sell_callback (test_update.CallbackTests.test_duplicate_sell_callback) ... ok
+test_unauthorized_callback (test_update.CallbackTests.test_unauthorized_callback) ... ok
+test_button_layout (test_update.DisplayTests.test_button_layout) ... ok
+test_center_negative (test_update.DisplayTests.test_center_negative) ... ok
+test_center_positive (test_update.DisplayTests.test_center_positive) ... ok
+test_free_feed_timestamp (test_update.DisplayTests.test_free_feed_timestamp) ... ok
+test_no_hourly_only_controls (test_update.DisplayTests.test_no_hourly_only_controls) ... ok
+test_one_forecast_each (test_update.DisplayTests.test_one_forecast_each) ... ok
+test_select_only_current_expiry (test_update.DisplayTests.test_select_only_current_expiry) ... ok
+test_stale_masks_predictions (test_update.DisplayTests.test_stale_masks_predictions) ... ok
+test_zero (test_update.DisplayTests.test_zero) ... ok
+test_many_hourly_strikes_produce_one_hourly_forecast (test_update.ForecastCardinalityTests.test_many_hourly_strikes_produce_one_hourly_forecast) ... ok
+test_dashboard_auth_and_command (test_update.HTTPIntegrationTests.test_dashboard_auth_and_command) ... ok
+test_sell_through_real_http_client_to_local_mock (test_update.HTTPIntegrationTests.test_sell_through_real_http_client_to_local_mock) ... ok
+test_best_bid_unsorted (test_update.SellTests.test_best_bid_unsorted) ... ok
+test_buy_hourly_rejected (test_update.SellTests.test_buy_hourly_rejected) ... ok
+test_buy_no_fresh_ask (test_update.SellTests.test_buy_no_fresh_ask) ... ok
+test_buy_rejects_higher_ask (test_update.SellTests.test_buy_rejects_higher_ask) ... ok
+test_buy_yes_fresh_ask (test_update.SellTests.test_buy_yes_fresh_ask) ... ok
+test_closed_rejected (test_update.SellTests.test_closed_rejected) ... ok
+test_concurrent_orders_blocked (test_update.SellTests.test_concurrent_orders_blocked) ... ok
+test_expired_rejected (test_update.SellTests.test_expired_rejected) ... ok
+test_fractional_position (test_update.SellTests.test_fractional_position) ... ok
+test_hourly_rejected (test_update.SellTests.test_hourly_rejected) ... ok
+test_live_disabled (test_update.SellTests.test_live_disabled) ... ok
+test_malformed_response_blocks_retry (test_update.SellTests.test_malformed_response_blocks_retry) ... ok
+test_no_liquidity (test_update.SellTests.test_no_liquidity) ... ok
+test_no_position (test_update.SellTests.test_no_position) ... ok
+test_nonnetted_rejected (test_update.SellTests.test_nonnetted_rejected) ... ok
+test_partial_fill (test_update.SellTests.test_partial_fill) ... ok
+test_position_pagination (test_update.SellTests.test_position_pagination) ... ok
+test_sell_no_full (test_update.SellTests.test_sell_no_full) ... ok
+test_sell_not_dependent_on_proxy_feed (test_update.SellTests.test_sell_not_dependent_on_proxy_feed) ... ok
+test_sell_yes_full (test_update.SellTests.test_sell_yes_full) ... ok
+test_timeout_not_retried (test_update.SellTests.test_timeout_not_retried) ... ok
+test_wrong_position_record_not_sold (test_update.SellTests.test_wrong_position_record_not_sold) ... ok
+test_zero_fill (test_update.SellTests.test_zero_fill) ... ok
+
+----------------------------------------------------------------------
+Ran 37 tests in 0.055s
+
+OK
