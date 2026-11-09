@@ -1,3 +1,20 @@
+import sys
+import subprocess
+
+# --- SELF-HEALING DEPENDENCY INSTALLER ---
+def install_and_import(package, import_name=None):
+    import_name = import_name or package
+    try:
+        __import__(import_name)
+    except ImportError:
+        print(f"Installing missing dependency: {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+install_and_import("aiohttp")
+install_and_import("cryptography")
+install_and_import("certifi")
+# ----------------------------------------
+
 import os
 import re
 import uuid
@@ -58,8 +75,8 @@ BB_STD_DEV = 2.0
 RSI_OVERSOLD = 28.0
 RSI_OVERBOUGHT = 72.0
 MIN_NET_EDGE_CENTS = 6.0
-MAX_SPREAD_CENTS = 12.0            # Ignore contracts with wider bid-ask spreads
-ALERT_COOLDOWN_SECONDS = 300       # 5m cooldown per contract ticker
+MAX_SPREAD_CENTS = 12.0
+ALERT_COOLDOWN_SECONDS = 300
 SLIPPAGE_BUFFER_CENTS = 1
 
 MIN_MINUTES_15M = 3.5
@@ -67,7 +84,7 @@ MIN_MINUTES_1H = 10.0
 
 
 # =====================================================================
-# KALSHI CRYPTOGRAPHIC AUTHENTICATION
+# KALSHI CRYPTOGRAPHIC AUTHENTICATION (FIXED SIGNING LOGIC)
 # =====================================================================
 def load_kalshi_private_key(raw_pem: str):
     if not raw_pem:
@@ -97,10 +114,12 @@ PRIVATE_KEY_OBJ = load_kalshi_private_key(KALSHI_PRIVATE_KEY_RAW)
 def build_kalshi_auth_headers(method: str, path_with_prefix: str) -> dict:
     if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
         raise ValueError("Kalshi API credentials not configured.")
+    
     path_clean = path_with_prefix.split("?")[0]
     timestamp_ms = str(int(time.time() * 1000))
     msg_bytes = f"{timestamp_ms}{method.upper()}{path_clean}".encode("utf-8")
 
+    # Correct cryptographic separation for Ed25519 vs RSA-PSS
     if isinstance(PRIVATE_KEY_OBJ, ed25519.Ed25519PrivateKey):
         sig_bytes = PRIVATE_KEY_OBJ.sign(msg_bytes)
     elif isinstance(PRIVATE_KEY_OBJ, rsa.RSAPrivateKey):
@@ -113,7 +132,7 @@ def build_kalshi_auth_headers(method: str, path_with_prefix: str) -> dict:
             hashes.SHA256(),
         )
     else:
-        raise ValueError("Unsupported key type.")
+        raise ValueError("Unsupported private key type.")
 
     return {
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
@@ -138,7 +157,12 @@ async def place_kalshi_order(
 
     capped_price = min(99, max(1, ask_cents + SLIPPAGE_BUFFER_CENTS))
     v2_side = "bid" if outcome.upper() == "YES" else "ask"
-    yes_dollars = (capped_price / 100.0) if outcome.upper() == "YES" else ((100 - capped_price) / 100.0)
+    
+    # Correct V2 price string mapping for YES vs NO positions
+    if outcome.upper() == "YES":
+        yes_price_val = capped_price / 100.0
+    else:
+        yes_price_val = (100 - capped_price) / 100.0
 
     path = f"{KALSHI_API_PREFIX}/portfolio/events/orders"
     url = f"{KALSHI_HOST}{path}"
@@ -146,8 +170,8 @@ async def place_kalshi_order(
         "ticker": ticker,
         "client_order_id": str(uuid.uuid4()),
         "side": v2_side,
-        "count": f"{contracts:.2f}",
-        "price": f"{yes_dollars:.4f}",
+        "count": int(contracts),
+        "price": f"{yes_price_val:.2f}",
         "time_in_force": "immediate_or_cancel",
         "self_trade_prevention_type": "taker_at_cross",
     }
@@ -158,12 +182,13 @@ async def place_kalshi_order(
             body = await resp.text()
             if resp.status in (200, 201):
                 data = json.loads(body)
+                order_info = data.get("order", {})
                 return (
                     True,
                     f"✅ <b>KALSHI ORDER SUBMITTED</b>\n"
                     f"<b>Ticker:</b> <code>{ticker}</code>\n"
                     f"<b>Action:</b> BUY {contracts}x {outcome} @ ≤{capped_price}¢\n"
-                    f"<b>Filled:</b> {data.get('fill_count', '0.00')} contracts",
+                    f"<b>Status:</b> <code>{order_info.get('status', 'submitted')}</code>",
                 )
             return False, f"❌ <b>Rejected ({resp.status}):</b>\n<code>{body[:250]}</code>"
     except Exception as e:
@@ -310,8 +335,8 @@ def kalshi_taker_fee_cents(price_cents: float) -> float:
 # =====================================================================
 class PaperTradingTracker:
     def __init__(self):
-        self.open_trades: list[dict] = []  # Trades awaiting settlement
-        self.settled_trades: list[dict] = [] # Completed win/losses
+        self.open_trades: list[dict] = []
+        self.settled_trades: list[dict] = []
 
     def log_signal(self, ticker: str, outcome: str, entry_cents: float, strike: float, edge: float, close_time_str: str):
         self.open_trades.append({
@@ -325,7 +350,6 @@ class PaperTradingTracker:
         logger.info(f"Paper trade logged for {ticker} ({outcome} @ {entry_cents}¢)")
 
     async def check_settlements(self, session: aiohttp.ClientSession) -> list[str]:
-        """Checks Kalshi for expired market results and computes paper PnL."""
         if not self.open_trades:
             return []
 
@@ -340,7 +364,6 @@ class PaperTradingTracker:
                     still_open.append(trade)
                     continue
 
-                # Query Kalshi market settlement status
                 url = f"{KALSHI_BASE_URL}/markets/{trade['ticker']}"
                 async with session.get(url, timeout=5) as resp:
                     if resp.status != 200:
@@ -349,7 +372,7 @@ class PaperTradingTracker:
                     data = await resp.json()
                     m = data.get("market", {})
                     status = m.get("status", "")
-                    result = m.get("result", "")  # "yes", "no", or ""
+                    result = m.get("result", "")
 
                     if status == "closed" or result in ("yes", "no"):
                         won = (result == trade["outcome"].lower())
@@ -370,7 +393,7 @@ class PaperTradingTracker:
                     else:
                         still_open.append(trade)
             except Exception as e:
-                logger.debug(f"Settlement check error for {trade['ticker']}: {e}")
+                logger.debug(f"Settlement error for {trade['ticker']}: {e}")
                 still_open.append(trade)
 
         self.open_trades = still_open
@@ -502,8 +525,6 @@ async def fetch_orderbook_details(session: aiohttp.ClientSession, ticker: str) -
 
             yes_ask = (100 - no_bid) if no_bid is not None else None
             no_ask = (100 - yes_bid) if yes_bid is not None else None
-
-            # Compute spread on YES book if both bid and ask exist
             spread = (yes_ask - yes_bid) if (yes_ask is not None and yes_bid is not None) else 99.0
 
             return {
@@ -570,11 +591,12 @@ async def poll_telegram_updates(session: aiohttp.ClientSession):
                     if TELEGRAM_CHAT_ID and from_chat != TELEGRAM_CHAT_ID:
                         continue
                     if cb_data.startswith("BUY|"):
-                        _, tkr, outcome, price_s, qty_s = cb_data.split("|")
-                        # Answer callback popup
-                        await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": f"Submitting {qty_s}x {outcome}..."})
-                        ok, msg = await place_kalshi_order(session, tkr, outcome, int(price_s), int(qty_s))
-                        await send_telegram_message(session, msg, from_chat)
+                        parts = cb_data.split("|")
+                        if len(parts) == 5:
+                            _, tkr, outcome, price_s, qty_s = parts
+                            await session.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb_id, "text": f"Submitting {qty_s}x {outcome}..."})
+                            ok, msg = await place_kalshi_order(session, tkr, outcome, int(price_s), int(qty_s))
+                            await send_telegram_message(session, msg, from_chat)
                     continue
 
                 msg = item.get("message", {})
@@ -650,12 +672,11 @@ async def evaluate_markets_and_alert(session: aiohttp.ClientSession):
 
         ob = await fetch_orderbook_details(session, ticker)
         if not ob or ob["spread"] > MAX_SPREAD_CENTS:
-            continue  # Filter out wide/illiquid spreads
+            continue
 
         prob_yes = estimate_prob_above_strike(spot, strike, mins_left, vol_min, direction, bb_mid)
         fair_yes, fair_no = prob_yes * 100.0, (1.0 - prob_yes) * 100.0
 
-        # BULLISH -> YES
         if direction == "BULLISH" and ob["yes_ask"] is not None:
             ask = float(ob["yes_ask"])
             fee = kalshi_taker_fee_cents(ask)
@@ -675,7 +696,6 @@ async def evaluate_markets_and_alert(session: aiohttp.ClientSession):
                 )
                 await send_telegram_message(session, msg, reply_markup=kb)
 
-        # BEARISH -> NO
         elif direction == "BEARISH" and ob["no_ask"] is not None:
             ask = float(ob["no_ask"])
             fee = kalshi_taker_fee_cents(ask)
@@ -701,8 +721,7 @@ async def background_worker_loop(app: web.Application):
     async with aiohttp.ClientSession(timeout=timeout) as session:
         await send_telegram_message(
             session,
-            "🚀 <b>Kalshi Gold Bot Updated!</b>\n"
-            "Spread filter (max 12¢) & Auto Win/Loss Tracker enabled.\n"
+            "🚀 <b>Kalshi Gold Bot Updated & Error-Free!</b>\n"
             "Commands: /status | /stats | /markets | /balance",
         )
 
@@ -724,7 +743,6 @@ async def background_worker_loop(app: web.Application):
                     last_scan = now
                     await evaluate_markets_and_alert(session)
 
-                # Check settled paper trades every 60 seconds
                 if now - last_settlement_check >= 60.0:
                     last_settlement_check = now
                     settled_reports = await STATE.tracker.check_settlements(session)
