@@ -1,3 +1,2 @@
-aiohttp==3.10.10
-certifi==2024.8.30
-cryptography==43.0.3
+aiohttp>=3.10,<4
+cryptography>=42

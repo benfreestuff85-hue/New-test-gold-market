@@ -1,0 +1,229 @@
+--- original/bot.py
++++ updated/bot.py
+@@ -8,6 +8,9 @@
+ import asyncio
+ import logging
+ import statistics
++import html
++import sys
++from free_gold import MONITOR, dashboard_auth, dashboard, state_api, command_api, terminal_commands
+ from datetime import datetime, timezone
+ from collections import deque
+ import aiohttp
+@@ -41,13 +44,11 @@
+ )
+ KALSHI_API_PREFIX = "/trade-api/v2"
+ KALSHI_BASE_URL = f"{KALSHI_HOST}{KALSHI_API_PREFIX}"
+-GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLD1H", "KXGOLDD"]
+-
+-# Pyth Network Hermes API for Metal.XAU/USD (Spot Gold)
+-PYTH_XAU_FEED_ID = "0x765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
+-PYTH_HERMES_URL = (
+-    f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={PYTH_XAU_FEED_ID}"
+-)
++GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLDH"]
++
++# Subscription-free spot proxy; official results remain Kalshi's.
++ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
++TERMINAL_OUTPUT = os.getenv("TERMINAL_OUTPUT", "true").lower() == "true"
+ 
+ # Strategy, Filter & Paper Trading Parameters
+ POLL_INTERVAL_SECONDS = 5
+@@ -142,6 +143,12 @@
+     ask_cents: int,
+     contracts: int,
+ ) -> tuple[bool, str]:
++    if not ENABLE_LIVE_ORDERS:
++        return False, "Live orders disabled. This is a free spot-proxy monitor."
++    if not MONITOR.fresh():
++        return False, "Order blocked: gold proxy feed is stale or unavailable."
++    if outcome.upper() not in ("YES", "NO") or not 1 <= contracts <= 100:
++        return False, "Invalid order outcome or quantity."
+     if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
+         return (
+             False,
+@@ -433,49 +440,19 @@
+ 
+ 
+ async def fetch_spot_gold_price(session: aiohttp.ClientSession) -> float | None:
++    return await MONITOR.fetch(session, STATE)
++
++
++def parse_strike(m: dict) -> float | None:
++    kind = m.get("strike_type")
++    key = "floor_strike" if kind in ("greater", "greater_or_equal") else "cap_strike" if kind in ("less", "less_or_equal") else None
++    if not key:
++        return None
+     try:
+-        async with session.get(PYTH_HERMES_URL, timeout=4) as resp:
+-            if resp.status == 200:
+-                data = await resp.json()
+-                parsed = data.get("parsed", [])
+-                if parsed:
+-                    p_obj = parsed[0].get("price", {})
+-                    spot = float(p_obj.get("price", 0)) * (10 ** int(p_obj.get("expo", 0)))
+-                    if spot > 500:
+-                        STATE.spot_source = "Pyth XAU/USD"
+-                        return round(spot, 2)
+-    except Exception:
+-        pass
+-
+-    try:
+-        async with session.get("https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD", timeout=4) as resp:
+-            if resp.status == 200:
+-                data = await resp.json()
+-                if data and "spreadProfilePrices" in data[0]:
+-                    pr = data[0]["spreadProfilePrices"][0]
+-                    mid = (float(pr["bid"]) + float(pr["ask"])) / 2.0
+-                    if mid > 500:
+-                        STATE.spot_source = "Swissquote (Fallback)"
+-                        return round(mid, 2)
+-    except Exception:
+-        pass
+-    return None
+-
+-
+-def parse_strike(m: dict) -> float | None:
+-    for k in ("floor_strike", "cap_strike", "strike_price", "custom_strike"):
+-        v = m.get(k)
+-        if isinstance(v, (int, float)) and v > 500:
+-            return float(v)
+-    text = f"{m.get('subtitle', '')} {m.get('yes_sub_title', '')} {m.get('title', '')}".replace(",", "").replace("$", "")
+-    for t in text.split():
+-        try:
+-            val = float(t)
+-            if 1500 < val < 15000:
+-                return val
+-        except ValueError:
+-            continue
+-    return None
++        value = float(m[key])
++        return value if math.isfinite(value) and value > 0 else None
++    except (KeyError, ValueError, TypeError):
++        return None
+ 
+ 
+ def parse_close_time(m: dict) -> str | None:
+@@ -505,9 +482,11 @@
+             if resp.status != 200:
+                 return None
+             data = await resp.json()
+-            ob = data.get("orderbook", {})
++            ob = data.get("orderbook_fp") or data.get("orderbook", {})
+ 
+             yd, nd = ob.get("yes_dollars"), ob.get("no_dollars")
++            if yd: yd = sorted(yd, key=lambda item: float(item[0]))
++            if nd: nd = sorted(nd, key=lambda item: float(item[0]))
+             if yd is not None or nd is not None:
+                 yes_bid = round(float(yd[-1][0]) * 100) if yd else None
+                 yes_qty = float(yd[-1][1]) if yd else 0
+@@ -601,6 +580,12 @@
+                 text = (msg.get("text") or "").strip().lower()
+                 chat_id = str(msg.get("chat", {}).get("id", ""))
+                 if not text or not is_authorized(chat_id):
++                    continue
++
++                if text.split()[0].split("@")[0] in ("/gauge", "/predict", "/feed", "/mute", "/unmute", "/threshold", "/help"):
++                    reply = MONITOR.command(text)
++                    for offset in range(0, len(reply), 3000):
++                        await send_telegram_message(session, "<pre>" + html.escape(reply[offset:offset+3000]) + "</pre>", chat_id)
+                     continue
+ 
+                 if text.startswith("/status") or text.startswith("/start"):
+@@ -640,7 +625,7 @@
+ # =====================================================================
+ async def evaluate_markets_and_alert(session: aiohttp.ClientSession):
+     spot = STATE.latest_spot
+-    if spot is None:
++    if spot is None or not MONITOR.fresh() or MONITOR.muted:
+         return
+ 
+     sig_1m = detect_reversal_signal(STATE.candles_1m, "1m")
+@@ -661,6 +646,8 @@
+     for m in markets:
+         ticker = m.get("ticker", "")
+         series = m.get("series_ticker", "")
++        if m.get("strike_type") not in ("greater", "greater_or_equal"):
++            continue
+         if not ticker or now - STATE.last_alerts.get(ticker, 0) < ALERT_COOLDOWN_SECONDS:
+             continue
+ 
+@@ -677,7 +664,7 @@
+ 
+         if "15M" in series and (mins_left < MIN_MINUTES_15M or mins_left > 16.0):
+             continue
+-        if "1H" in series and (mins_left < MIN_MINUTES_1H or mins_left > 65.0):
++        if series == "KXGOLDH" and (mins_left < MIN_MINUTES_1H or mins_left > 65.0):
+             continue
+ 
+         ob = await fetch_orderbook_details(session, ticker)
+@@ -700,6 +687,7 @@
+                     f"🟢 <b>BULLISH GOLD REVERSAL — BUY YES</b>\n"
+                     f"<b>Contract:</b> <code>{ticker}</code> ({mins_left:.1f}m left)\n"
+                     f"<b>Strike:</b> ${strike:,.2f} | <b>Spot:</b> ${spot:,.2f}\n"
++                    f"<b>Data:</b> free spot proxy, NOT exact Pyth settlement index. Score is uncalibrated.\n"
+                     f"<b>Trigger:</b> {active_sig['reason']}\n"
+                     f"<b>Kalshi Ask:</b> {ask:.0f}¢ (Spread: {ob['spread']:.0f}¢) | <b>Fair Value:</b> {fair_yes:.1f}¢\n"
+                     f"<b>Net Edge:</b> <b>+{net_edge:.1f}¢</b> (Paper trade logged ✅)"
+@@ -719,6 +707,7 @@
+                     f"🔴 <b>BEARISH GOLD REVERSAL — BUY NO</b>\n"
+                     f"<b>Contract:</b> <code>{ticker}</code> ({mins_left:.1f}m left)\n"
+                     f"<b>Strike:</b> ${strike:,.2f} | <b>Spot:</b> ${spot:,.2f}\n"
++                    f"<b>Data:</b> free spot proxy, NOT exact Pyth settlement index. Score is uncalibrated.\n"
+                     f"<b>Trigger:</b> {active_sig['reason']}\n"
+                     f"<b>Kalshi Ask:</b> {ask:.0f}¢ (Spread: {ob['spread']:.0f}¢) | <b>Fair Value:</b> {fair_no:.1f}¢\n"
+                     f"<b>Net Edge:</b> <b>+{net_edge:.1f}¢</b> (Paper trade logged ✅)"
+@@ -742,17 +731,14 @@
+             try:
+                 now = time.time()
+                 spot = await fetch_spot_gold_price(session)
+-                if spot is not None:
+-                    STATE.latest_spot = spot
+-                    STATE.latest_spot_ts = now
+-                    STATE.candles_1m.update(spot, now)
+-                    STATE.candles_5m.update(spot, now)
+-
+                 await poll_telegram_updates(session)
+ 
+                 if now - last_scan >= SCAN_INTERVAL_SECONDS:
+                     last_scan = now
++                    await MONITOR.refresh(session, sys.modules[__name__])
+                     await evaluate_markets_and_alert(session)
++                    if TERMINAL_OUTPUT:
++                        print(MONITOR.command("gauge"), flush=True)
+ 
+                 if now - last_settlement_check >= 60.0:
+                     last_settlement_check = now
+@@ -776,6 +762,9 @@
+         "status": "online",
+         "spot_gold": STATE.latest_spot,
+         "spot_source": STATE.spot_source,
++        "quote_fresh": MONITOR.fresh(),
++        "feed_status": MONITOR.status,
++        "forecast_type": "Free spot proxy, not exact Pyth settlement index",
+         "open_trades": len(STATE.tracker.open_trades),
+         "settled_trades": len(STATE.tracker.settled_trades),
+     })
+@@ -784,15 +773,20 @@
+ async def worker_context(app: web.Application):
+     """Start the background worker with the server and stop it cleanly on shutdown."""
+     task = asyncio.create_task(background_worker_loop(app))
++    commands = asyncio.create_task(terminal_commands())
+     yield
+     task.cancel()
+-    await asyncio.gather(task, return_exceptions=True)
++    commands.cancel()
++    await asyncio.gather(task, commands, return_exceptions=True)
+ 
+ 
+ def create_app() -> web.Application:
+-    app = web.Application()
++    app = web.Application(middlewares=[dashboard_auth], client_max_size=4096)
+     app.router.add_get("/", handle_health)
+     app.router.add_get("/health", handle_health)
++    app.router.add_get("/dashboard", dashboard)
++    app.router.add_get("/api/gold", state_api)
++    app.router.add_post("/api/command", command_api)
+     app.cleanup_ctx.append(worker_context)
+     return app
+ 
