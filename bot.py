@@ -47,7 +47,7 @@ KALSHI_API_PREFIX = "/trade-api/v2"
 KALSHI_BASE_URL = f"{KALSHI_HOST}{KALSHI_API_PREFIX}"
 GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLDH"]
 
-# Free proxy mode: no Pyth subscription and no Swissquote fallback.
+# Free spot proxy; no paid Pyth subscription and no alternate-provider fallback.
 ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
 TERMINAL_OUTPUT = os.getenv("TERMINAL_OUTPUT", "true").lower() == "true"
 
@@ -138,8 +138,8 @@ def build_kalshi_auth_headers(method: str, path_with_prefix: str) -> dict:
 
 
 async def place_kalshi_order(session, ticker, outcome, ask_cents, contracts):
-    # Compatibility wrapper: stale alert price is ignored; fresh ask fetched by Execution.
-    return await EXECUTION.buy(session, ticker, outcome, contracts)
+    # Legacy callers cannot bypass explicit side selection and quote binding.
+    return False, "Use /predict, select YES or NO, then use its current buy buttons."
 
 
 async def fetch_kalshi_balance(session: aiohttp.ClientSession) -> str:
@@ -399,7 +399,7 @@ def parse_strike(m):
     try:
         value = float(m[key])
         return value if math.isfinite(value) and value > 0 else None
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -446,9 +446,9 @@ async def fetch_orderbook_details(session: aiohttp.ClientSession, ticker: str) -
             if yd: yd = sorted(yd, key=lambda level: float(level[0]))
             if nd: nd = sorted(nd, key=lambda level: float(level[0]))
             if yd is not None or nd is not None:
-                yes_bid = round(float(yd[-1][0]) * 100) if yd else None
+                yes_bid = float(yd[-1][0]) * 100 if yd else None
                 yes_qty = float(yd[-1][1]) if yd else 0
-                no_bid = round(float(nd[-1][0]) * 100) if nd else None
+                no_bid = float(nd[-1][0]) * 100 if nd else None
                 no_qty = float(nd[-1][1]) if nd else 0
             else:
                 yb, nb = ob.get("yes") or [], ob.get("no") or []
@@ -478,13 +478,8 @@ async def fetch_orderbook_details(session: aiohttp.ClientSession, ticker: str) -
 # TELEGRAM BOT & COMMANDS
 # =====================================================================
 def build_keyboard(ticker, outcome, ask_cents):
-    # Legacy callers cannot attach hourly controls.
-    if not ticker.startswith("KXGOLD15M-"):
-        return None
-    row = next((row for row in MONITOR.rows if row["minutes"] == 15), None)
-    if not row or row["ticker"] != ticker:
-        return None
-    return MONITOR.keyboard()
+    # No old, preselected buy controls. New controls are made by GoldMonitor.
+    return None
 
 
 async def send_telegram_message(session: aiohttp.ClientSession, text: str, chat_id: str | None = None, reply_markup: dict | None = None):
@@ -499,6 +494,9 @@ async def send_telegram_message(session: aiohttp.ClientSession, text: str, chat_
         async with session.post(url, json=payload, timeout=6) as resp:
             if resp.status != 200:
                 logger.warning(f"Telegram sendMessage failed: HTTP {resp.status}")
+                return None
+            result = await resp.json()
+            return result.get("result") if result.get("ok") else None
     except Exception as e:
         logger.warning(f"Telegram sendMessage error: {e}")
 

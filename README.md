@@ -1,135 +1,150 @@
-# Compact 15m / 1h forecast + 15m-only trading controls
+# Complete gold bot — explicit YES/NO selector
 
-## Package and deployment
-This package extends the supplied original bot.py with the free spot-feed build and
-new compact reports/trade controls. It was not fetched from your deployed repository.
-Replace bot.py and free_gold.py and ADD trade_controls.py in the same project folder.
-Keep your credentials in Render Environment, never in GitHub.
-requirements.txt, test_update.py, changes.diff and TEST_RESULTS.txt are included.
+## Deploy this complete package
+Replace bot.py, free_gold.py AND trade_controls.py together in your Render-linked
+repository; also upload requirements.txt. No earlier generated runtime module needed.
+This extends the supplied original bot.py and includes the agreed free-feed build,
+compact reports and trade controls. It was not retrieved from your live deployment.
+changes.diff is cumulative against the supplied original, not your deployed copy.
+Python 3.10+ required.
 
 Render Build Command: python -m pip install -r requirements.txt
 Render Start Command: python bot.py
-Commit all three runtime .py files and requirements.txt to the connected repo.
-Deploy the latest commit. Old buttons expire/reject after restart; send /predict.
-Dashboard: your Render service URL + /dashboard; use existing DASHBOARD_TOKEN.
-Dashboard commands cannot submit orders. Server uses 0.0.0.0 and PORT (default 10000).
-Root and /health retain the original public health/price summary. Remote dashboard
-API access requires DASHBOARD_TOKEN. Use HTTPS; token is stored in sessionStorage.
+Commit the files, then deploy latest commit. Do not paste shell commands into Python.
+Keep Telegram/Kalshi keys in Render Environment, not source control.
+Existing DASHBOARD_TOKEN works. No paid Pyth subscription or gold feed API key.
+ENABLE_LIVE_ORDERS defaults false; keep false during deployment/demo testing.
+The package does NOT reset existing Render environment values (including true).
 
-## Requested compact layout
-/predict and /test now use the same HTML report formatter as live forecast alerts.
-They show ONE 15-minute section with projected finishing spot price, target,
-YES/NO prediction, score and center-out filled rectangular gauge.
-They show ONE hourly section with projected finish, time and gauge ONLY.
-No hourly per-strike forecast list; no hourly YES/NO list; no hourly buttons.
-/gauge gives just the two one-line gauges. /feed is a short diagnostic, not raw JSON.
-Full contract lists remain confined to /markets (original limited listing).
-/status and /stats preserve original paper-tracker diagnostics.
+## Trading UI: 15-minute only
+/predict and /test send one formatted report, with ONE 15-minute and ONE hourly forecast.
+Initially:
+  SELL ALL — actual held side/quantity at last check (15M)
+  Select YES | Select NO
+No buy buttons until you explicitly select a side.
+After choosing NO:
+  SELL ALL — actual held-side snapshot (15M)
+  Select YES | NO SELECTED
+  Buy 1 NO @ price | Buy 5 NO @ price | Buy 10 NO @ price
 
-Negative gauge fills LEFT from center; positive fills RIGHT. Telegram uses monospace.
-For each series, select the nearest unexpired active market that has opened and has
-not reached trading close. At the same expiry choose nearest threshold to spot,
-then lexical ticker for a deterministic tie-break. The 15m is normally a single market.
-Hourly forecast uses the chosen expiry once, regardless of number of strikes.
+Choosing a side does not submit an order. The model prediction never auto-selects it.
+Selection updates the SAME Telegram message keyboard, refreshing that side's ask.
+Switching sides invalidates the old generation BEFORE any await, so delayed old buy
+buttons cannot execute the former side. Failed keyboard update fails closed; /predict.
+Each Buy binds exact ticker, selected side, quantity and displayed price cap.
+The three quantities remain 1/5/10. Current ask is fetched again at execution; higher
+than displayed cap is rejected rather than accepting hidden slippage.
+Each buy/sell attempt consumes the message controls; /predict for a new set afterward.
+Buys expire 90 seconds after side selection; sell/selector contexts expire after 30 min.
 
-## Buttons: ONLY the selected KXGOLD15M contract
-Top inline-keyboard row: SELL ALL — 15M CONTRACT
-Bottom row: Buy 1 / Buy 5 / Buy 10, for the predicted 15m YES or NO side, with quoted price.
-Telegram places the keyboard below the body; top means top button row, not above text.
-Buy buttons appear only with an available prediction and executable snapshot quote.
-Sell may still appear during forecast warm-up, to permit exits of existing holdings.
-No buttons if no active 15m contract is found. Missing forecasts do not invent a side.
-/test is now a preview of the REAL current market, not the old fake TEST ticker.
-If trading is enabled, its controls ARE real. Keep live trading disabled during testing.
-Legacy BUY callbacks are rejected; they cannot bypass the new 15m restriction.
+SELL ALL ignores the purchase selector and fetches ACTUAL holdings again. Choosing
+YES while holding NO still causes SELL ALL to close held NO, not buy YES or sell
+imaginary YES. Label is a snapshot, not a guarantee of your current holdings.
+No side selection needed for selling existing shares. Only exact selected 15m ticker,
+not every 15m market in your account. Default/key-bound primary subaccount only.
+Hourlies have NO controls; context creation and execution independently reject them.
+Old BUY/G2 callbacks and legacy place_kalshi_order cannot bypass the selector.
+/test is now a preview of the REAL current contract. If live orders are enabled,
+its buy/sell controls are real, not simulated. No further confirmation dialog after click.
 
-## Sell-all behavior and limits
-Fresh position GET /portfolio/positions with exact ticker and pagination.
-Fresh market status/close-time and identity check; only KXGOLD15M-prefix market AND
-matching KXGOLD15M event are allowed. Hourly rejected even if a callback is forged.
-Fresh orderbook, sorted bids, fixed-point quantities/prices.
-Positive net YES -> ask on YES book at current best YES bid.
-Negative net NO -> bid on YES book at 1 minus current best NO bid.
-POST /portfolio/events/orders with reduce_only=true and immediate_or_cancel.
-Server-side reduce-only caps quantity to the position; it cannot reverse the holding.
-Quantity requests the full current net position, including fractional contracts.
-Zero positions, non-netted/ambiguous records, closed markets, and empty books send no order.
-Netting_enabled must explicitly be true. This does not liquidate separate hedged lots.
-Only the default primary/key-bound subaccount is accessed; not every subaccount.
-An unavailable gold proxy DOES NOT block selling; exit decisions use Kalshi data.
+## Owner binding
+Callbacks require authorized TELEGRAM_CHAT_ID AND owner user ID. Private chat defaults
+to that chat ID. For a group set TELEGRAM_USER_ID to your personal numeric user ID.
+Random opaque callback tokens bind ticker/side/price/message/chat in server memory.
+Message mismatch, stale/unknown/replaced tokens are rejected. Duplicate/concurrent
+button actions cannot reuse a consumed generation. Restart invalidates all old tokens.
 
-This is a price-protected attempt to sell all, NOT guaranteed liquidation. It sells
-at the observed best bid or better. It does not sweep down to arbitrarily worse prices.
-Thin liquidity or price movement may produce partial/zero fills. Unfilled IOC remainder
-is canceled, not left resting. Report shows executed count, unfilled requested count,
-average proceeds where available, order id and refreshed net position if accessible.
-Fees excluded from sale-price display. Existing outstanding orders are NOT canceled;
-those orders could subsequently alter your position. Other tickers are never sold.
+## Forecasts, alerts and gauges
+15m: one projected spot finish, structured target, model YES/NO, model score, time,
+center-fill rectangular gauge. Hourly: one projected spot finish, time and gauge only.
+Negative fills left from fixed center; positive fills right. Monospace in Telegram.
+/predict, /test and live forecast alerts share one HTML report formatter.
+/gauge gives two small lines. /feed is short, not raw JSON. /markets is the explicit
+contract list. /status /stats /balance retain original diagnostics.
+/mute /unmute /threshold 65 /help available through Telegram; omit / in terminal/dashboard.
+Mute suppresses alerts, not manual trades or official-result tracking.
+Original RSI/Bollinger reversal and edge/spread filters retained for selected 15m.
+Combined alert triggers on qualifying reversal or momentum threshold crossing, with
+original 300s cooldown and 10-point hysteresis. No auto orders added.
+Qualifying 15m reversal signals paper logged independently of manual selection.
+Original paper accounting is per-signal and excludes fees; not account execution PnL.
 
-## Buy safety
-Same 15m market check and lock as selling. Quantities only 1/5/10.
-Fresh executable ask; refuse if above the price displayed when buttons were created.
-Fresh proxy required. Buy contexts expire after 90 seconds; sell contexts after 30 minutes.
-Each context allows one buy action and one sell action. Repeat /predict for new controls.
-Callbacks require owner chat AND owner Telegram user id. For groups set TELEGRAM_USER_ID.
-Duplicate callback ids/actions are consumed before awaits. Buy/sell locks prevent overlap.
-Opaque random callback tokens bind the original ticker/outcome on the server.
+For each series choose earliest future expiry of currently active/open markets that
+have actually opened and have not reached trading close. At same expiry, nearest
+structured strike to current spot, then ticker tie-break. Never output every hourly
+strike. When no active 15m contract is found, no trade controls are invented.
+Model missing or target unknown does not prevent explicit manual side selection,
+but buys require fresh proxy data and executable quote. Missing quotes keep buys hidden.
 
-All writes default DISABLED: ENABLE_LIVE_ORDERS=false. To enable actual manual trades
-set true deliberately. KALSHI_USE_DEMO controls which environment receives them.
-Neither /predict nor live alerts submit orders by themselves. No automatic trades added.
-Timeout/malformed response/other POST error creates an in-memory uncertain-submission
-block for that ticker. No automatic retry. Check client_order_id in Kalshi before
-further trading. There is no automatic uncertainty-clear command. Restart clears the
-block and button contexts, but DOES NOT prove the old submission failed. Check account
-first; duplicate prevention is not durable across a restart/deploy. Existing pending
-orders and actions from another client may change positions concurrently.
+## Free feed and limitations
+Only https://api.gold-api.com/price/XAU; no key, no Swissquote fallback, no paid Pyth.
+Validate XAU/USD, finite positive price and provider updatedAt. Default age max 60s,
+future skew max 5s. Out-of-order/stale timestamps rejected. Network failure marks
+feed unavailable immediately. Last known price may display as stale; forecasts suppressed.
+Free provider availability, rate/usage terms, upstream changes and update frequency
+not guaranteed. A prior public response was stale; verify freshness in your deployment.
 
-## Free source and forecast caveats
-https://api.gold-api.com/price/XAU (no key); no Pyth Pro, no Swissquote fallback.
-Strict provider updatedAt validation: default max age 60s, max future skew 5s, reject
-out-of-order, invalid symbol/currency and nonfinite price. Request failure immediately
-marks feed unavailable. Last-known price stays displayed as stale; forecasts suppressed.
-No guarantee of third-party uptime, refresh rate, data license or unchanged free terms.
-A previous fetched public response was stale; verify freshness from your own deployment.
+Provider timestamps build candles; repeated timestamp does not fabricate new observations.
+>120s gaps reset 1m/5m histories; noncontiguous minute history blocks model output.
+~20 completed 1m candles warm-up. Early hourly gauge uses less than full-hour history.
+Projection uses clipped log-return drift and normal uncertainty; scores UNCALIBRATED.
+Free spot is a PROXY, not exact Pyth index. No profitability or accuracy guarantee.
+Kalshi published yes/no is sole source of official paper-trade settlement.
+Approximate horizon: expected_expiration_time, expiration_time, then close_time.
+These are not independently verified contractual observation windows. No averaging,
+rounding or candlestick settlement adapter is implemented. Do not confuse forecast
+with exact index settlement replication.
 
-Candles use provider time, not receive time. Identical timestamps do not generate new
-candles. >120s gaps reset history; noncontiguous minute history blocks model output.
-Warm-up: 20 completed 1m candles. Hourly gauge initially uses less than a full hour.
-Drift projection is clipped; uncertainty uses a normal-return approximation. Scores
-are uncalibrated, not trained/validated probabilities, not recommendations.
-Forecast expiry uses expected_expiration_time, expiration_time then close_time. These
-are approximate horizons, NOT independently verified contractual observation windows.
-No averaging/rounding/candlestick settlement adapter; FREE SPOT IS NOT EXACT PYTH INDEX.
-Kalshi published yes/no remains the sole settlement source for original paper tracking.
-Paper PnL retains the original fee-excluding per-signal behavior, not account PnL.
+## Sell implementation and guardrails
+Fresh identity, event prefix, market status/open/close time, exact position and book.
+Position pagination supported; requires position_fp and explicit netting_enabled=true.
+Non-netted/ambiguous positions unsupported and rejected, not guessed.
+Positive net YES: YES-book ask at current best YES bid.
+Negative net NO: YES-book bid at 1 minus current best NO bid.
+POST /portfolio/events/orders; reduce_only=true; immediate_or_cancel;
+fixed-point price/count; self_trade_prevention_type=taker_at_cross.
+Fractional net positions supported to 0.01. No position or empty bids -> no order.
+Gold proxy outage does NOT block a sell; it uses current Kalshi market/position data.
 
-## Alerts and persistence
-One combined alert message, same formatter as /predict. Trigger on a momentum threshold
-crossing or the selected 15m RSI/Bollinger reversal passing original edge/spread filters.
-Cooldown remains original 300 seconds; threshold default 65 with 10-point hysteresis.
-No hourly paper-trade or hourly BUY/SELL buttons. 15m qualifying reversal paper signals
-are still recorded. /mute suppresses alerts, not settlement tracking or manual trades.
-Dashboard polls state every 2 seconds; scan interval 15 seconds plus network latency.
-Terminal input is supported when stdin allows async readers; Telegram/dashboard remain
-available when a host does not expose interactive stdin. No browser push notifications.
-History, paper tracker, locks, callback tokens and uncertainty state are in memory.
-Restart/deploy resets these. Free Render can sleep after 15 minutes without inbound
-traffic, so it is not guaranteed 24/7 monitoring.
+This is an ATTEMPT to sell all at best bid or better, not guaranteed liquidation.
+No sweeping to arbitrary worse prices. Partial/zero fills possible. IOC remainder
+is canceled, not left resting. Report counts filled/unfilled, order ID, average price
+if provided and refreshed signed net position if readable. Prices shown before fees.
+Existing resting orders are NOT canceled and may change holdings afterward.
+No other market/subaccount liquidated. Server reduce-only prevents opening reverse holdings.
+Per-contract lock serializes local buy/sell. External clients can still change positions.
+
+POST exception/timeout/malformed result leaves ticker in uncertain-submission block;
+no automatic retry. Check client_order_id in Kalshi. No uncertainty-clear command.
+Restart clears in-memory block but DOES NOT prove old order failed. Inspect account
+before trying again. Duplicate prevention is not durable across restarts/deploys.
+ENABLE_LIVE_ORDERS=false blocks all writes. KALSHI_USE_DEMO chooses demo vs production.
+Use correct environment credentials; keys differ. No test here used a real account.
+
+## Dashboard and Render
+Server: 0.0.0.0, PORT default 10000. Public root/health retain original health summaries.
+Open service URL + /dashboard. Set a strong DASHBOARD_TOKEN for remote API/commands.
+Token stored in sessionStorage, not URLs; use HTTPS. No dashboard order buttons.
+Dashboard center-out gauges refresh from cached state every 2s. Market scans ~15s plus
+network latency; feed polling ~5s plus worker activity. No browser push notifications.
+Terminal stdin commands where async input supported; Render may not provide a terminal.
+No persistence for candles, paper tracker, controls, locks or uncertainty state.
+Restart/deploy starts warm-up again. Free Render may sleep after 15 minutes without
+incoming requests; not guaranteed continuous 24/7 alerting.
 
 ## Tests actually performed
 python -m unittest -v test_update.py
-37 automated tests passed: YES/NO liquidation mapping, partial/zero fills, fractional
-positions, closed/expired/hourly rejection, empty books, non-netted rejection,
-position pagination, duplicate/concurrent actions, POST uncertainty and no retries,
-fresh-ask buys with cap, one report per timeframe, center-fill gauges, button binding,
-stale suppression, owner authorization, plus local HTTP order-flow and dashboard-auth tests.
-The HTTP order-flow test used an in-process MOCK server only, never Kalshi.
-Bot import, route registration and syntax checked.
-No real orders, live credentials, Telegram delivery, visual browser layout, or deployment
-tested. Not a guarantee of execution or profitability. Test in Kalshi demo first.
+53 automated tests passed. Captured output: TEST_RESULTS.txt.
+Coverage: explicit selection, independent model/manual sides, switching revocation,
+message/owner binding, no orders on selector taps, duplicate handling, missing asks,
+UI-edit failures, 15m-only trading, partial/zero/fractional/full liquidation, netting,
+pagination, timeout/no retry, live disable, buy price cap, report cardinality and gauges.
+Local HTTP mock exercised sell request/response and dashboard auth. Runtime bot import,
+route registration, syntax and legacy write blocking checked. No live Kalshi order,
+live Telegram UI, browser rendering or deployment test performed. Nothing deployed.
 
-## API references
-https://docs.kalshi.com/api-reference/orders/create-order-v2.md
-https://docs.kalshi.com/api-reference/portfolio/get-positions
-https://docs.kalshi.com/api-reference/market/get-market
+## Package contents
+bot.py, free_gold.py, trade_controls.py, requirements.txt, env.example,
+test_update.py, TEST_RESULTS.txt, changes.diff, README.md, MANIFEST.json.
+env.example is a reference, not automatically loaded. No credentials included.
+Manifest provides SHA256/size; ZIP verified for integrity before delivery.

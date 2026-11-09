@@ -24,7 +24,7 @@
 -)
 +GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLDH"]
 +
-+# Free proxy mode: no Pyth subscription and no Swissquote fallback.
++# Free spot proxy; no paid Pyth subscription and no alternate-provider fallback.
 +ENABLE_LIVE_ORDERS = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
 +TERMINAL_OUTPUT = os.getenv("TERMINAL_OUTPUT", "true").lower() == "true"
  
@@ -86,8 +86,8 @@
 -    except Exception as e:
 -        return False, f"❌ <b>Exception:</b> <code>{e}</code>"
 +async def place_kalshi_order(session, ticker, outcome, ask_cents, contracts):
-+    # Compatibility wrapper: stale alert price is ignored; fresh ask fetched by Execution.
-+    return await EXECUTION.buy(session, ticker, outcome, contracts)
++    # Legacy callers cannot bypass explicit side selection and quote binding.
++    return False, "Use /predict, select YES or NO, then use its current buy buttons."
  
  
  async def fetch_kalshi_balance(session: aiohttp.ClientSession) -> str:
@@ -155,7 +155,7 @@
 -    return None
 +        value = float(m[key])
 +        return value if math.isfinite(value) and value > 0 else None
-+    except (KeyError, ValueError, TypeError):
++    except (KeyError, TypeError, ValueError):
 +        return None
  
  
@@ -200,7 +200,7 @@
      return markets
  
  
-@@ -505,9 +440,11 @@
+@@ -505,13 +440,15 @@
              if resp.status != 200:
                  return None
              data = await resp.json()
@@ -211,9 +211,15 @@
 +            if yd: yd = sorted(yd, key=lambda level: float(level[0]))
 +            if nd: nd = sorted(nd, key=lambda level: float(level[0]))
              if yd is not None or nd is not None:
-                 yes_bid = round(float(yd[-1][0]) * 100) if yd else None
+-                yes_bid = round(float(yd[-1][0]) * 100) if yd else None
++                yes_bid = float(yd[-1][0]) * 100 if yd else None
                  yes_qty = float(yd[-1][1]) if yd else 0
-@@ -540,17 +477,14 @@
+-                no_bid = round(float(nd[-1][0]) * 100) if nd else None
++                no_bid = float(nd[-1][0]) * 100 if nd else None
+                 no_qty = float(nd[-1][1]) if nd else 0
+             else:
+                 yb, nb = ob.get("yes") or [], ob.get("no") or []
+@@ -540,17 +477,9 @@
  # =====================================================================
  # TELEGRAM BOT & COMMANDS
  # =====================================================================
@@ -229,17 +235,22 @@
 -        ]
 -    }
 +def build_keyboard(ticker, outcome, ask_cents):
-+    # Legacy callers cannot attach hourly controls.
-+    if not ticker.startswith("KXGOLD15M-"):
-+        return None
-+    row = next((row for row in MONITOR.rows if row["minutes"] == 15), None)
-+    if not row or row["ticker"] != ticker:
-+        return None
-+    return MONITOR.keyboard()
++    # No old, preselected buy controls. New controls are made by GoldMonitor.
++    return None
  
  
  async def send_telegram_message(session: aiohttp.ClientSession, text: str, chat_id: str | None = None, reply_markup: dict | None = None):
-@@ -584,23 +518,21 @@
+@@ -565,6 +494,9 @@
+         async with session.post(url, json=payload, timeout=6) as resp:
+             if resp.status != 200:
+                 logger.warning(f"Telegram sendMessage failed: HTTP {resp.status}")
++                return None
++            result = await resp.json()
++            return result.get("result") if result.get("ok") else None
+     except Exception as e:
+         logger.warning(f"Telegram sendMessage error: {e}")
+ 
+@@ -584,23 +516,21 @@
  
                  cb = item.get("callback_query")
                  if cb:
@@ -272,7 +283,7 @@
                      continue
  
                  if text.startswith("/status") or text.startswith("/start"):
-@@ -618,9 +550,6 @@
+@@ -618,9 +548,6 @@
                      await send_telegram_message(session, b_msg, chat_id)
                  elif text.startswith("/stats"):
                      await send_telegram_message(session, STATE.tracker.get_stats_summary(), chat_id)
@@ -282,7 +293,7 @@
                  elif text.startswith("/markets"):
                      markets = await fetch_kalshi_gold_markets(session)
                      lines = ["<b>🏅 OPEN KALSHI GOLD MARKETS</b>"]
-@@ -638,92 +567,8 @@
+@@ -638,92 +565,8 @@
  # =====================================================================
  # SCANNER & OPPORTUNITY ENGINE
  # =====================================================================
@@ -377,7 +388,7 @@
  
  
  async def background_worker_loop(app: web.Application):
-@@ -733,7 +578,7 @@
+@@ -733,7 +576,7 @@
          await send_telegram_message(
              session,
              f"🚀 <b>Kalshi Gold Bot online</b> ({mode})\n"
@@ -386,7 +397,7 @@
          )
  
          last_scan = 0.0
-@@ -742,17 +587,14 @@
+@@ -742,17 +585,14 @@
              try:
                  now = time.time()
                  spot = await fetch_spot_gold_price(session)
@@ -407,7 +418,7 @@
  
                  if now - last_settlement_check >= 60.0:
                      last_settlement_check = now
-@@ -776,6 +618,8 @@
+@@ -776,6 +616,8 @@
          "status": "online",
          "spot_gold": STATE.latest_spot,
          "spot_source": STATE.spot_source,
@@ -416,7 +427,7 @@
          "open_trades": len(STATE.tracker.open_trades),
          "settled_trades": len(STATE.tracker.settled_trades),
      })
-@@ -784,15 +628,20 @@
+@@ -784,15 +626,20 @@
  async def worker_context(app: web.Application):
      """Start the background worker with the server and stop it cleanly on shutdown."""
      task = asyncio.create_task(background_worker_loop(app))

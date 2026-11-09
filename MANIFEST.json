@@ -1,0 +1,38 @@
+{
+  "bot.py": {
+    "bytes": 26184,
+    "sha256": "1bbb99acf80354e80b6b9190ba277136cfb675888ae151275a150059a5961ef4"
+  },
+  "free_gold.py": {
+    "bytes": 21597,
+    "sha256": "615c03d107afb350a2ed5673103e79072948b659407856fa306fbf8247e6a71e"
+  },
+  "trade_controls.py": {
+    "bytes": 8747,
+    "sha256": "370c8d8d354f4437c9664095f416a9313b69f4725edbaa44eb71605bdc08a131"
+  },
+  "requirements.txt": {
+    "bytes": 34,
+    "sha256": "b55c7f0b0e6d9fdb80db4275c98d627866767d3a2dd8a86537d0cead83d1b913"
+  },
+  "env.example": {
+    "bytes": 354,
+    "sha256": "ce25a49fab667ff2d77519c0f6b230c86949278c2a8b18a7200940af9ac0ad21"
+  },
+  "test_update.py": {
+    "bytes": 17478,
+    "sha256": "9f1f257c82d6d8864f15be4b86b22f3c84ec7d350a8b9edf8570c3df3a85a50f"
+  },
+  "TEST_RESULTS.txt": {
+    "bytes": 5526,
+    "sha256": "e1b9b71b172975eea4f34cde798d42fdbc763042ab4a2537932ead4b7fcd401b"
+  },
+  "changes.diff": {
+    "bytes": 19569,
+    "sha256": "5ee704916886410a43d7c9a36094af8d8e48633533573278d1cc39664164c001"
+  },
+  "README.md": {
+    "bytes": 9926,
+    "sha256": "7baacaa6aefe12b214b80a64877cc4db5a42b6f75c2378f495d4ad962653ff08"
+  }
+}
