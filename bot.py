@@ -1,7 +1,10 @@
 import os
+import re
+import uuid
 import math
 import time
 import json
+import base64
 import asyncio
 import logging
 import statistics
@@ -9,6 +12,9 @@ from datetime import datetime, timezone
 from collections import deque
 import aiohttp
 from aiohttp import web
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa, ed25519
 
 # =====================================================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
@@ -23,15 +29,26 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", 10000))
 
+# Kalshi API Credentials (from Render Environment Variables)
+KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID", "").strip()
+KALSHI_PRIVATE_KEY_RAW = os.getenv("KALSHI_PRIVATE_KEY", "").strip()
+# Set KALSHI_USE_DEMO="true" in Render if using demo.kalshi.co keys
+KALSHI_USE_DEMO = os.getenv("KALSHI_USE_DEMO", "false").strip().lower() == "true"
+
+KALSHI_HOST = (
+    "https://external-api.demo.kalshi.co"
+    if KALSHI_USE_DEMO
+    else "https://external-api.kalshi.com"
+)
+KALSHI_API_PREFIX = "/trade-api/v2"
+KALSHI_BASE_URL = f"{KALSHI_HOST}{KALSHI_API_PREFIX}"
+GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLD1H", "KXGOLDD"]
+
 # Pyth Network Hermes API for Metal.XAU/USD (Spot Gold)
 PYTH_XAU_FEED_ID = "0x765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2"
 PYTH_HERMES_URL = (
     f"https://hermes.pyth.network/v2/updates/price/latest?ids[]={PYTH_XAU_FEED_ID}"
 )
-
-# Kalshi Public Trade API v2
-KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-GOLD_SERIES_TICKERS = ["KXGOLD15M", "KXGOLD1H", "KXGOLDD"]
 
 # Strategy & Edge Parameters
 POLL_INTERVAL_SECONDS = 5          # Spot price sampling interval
@@ -43,10 +60,171 @@ RSI_OVERSOLD = 28.0                # Bullish exhaustion threshold
 RSI_OVERBOUGHT = 72.0              # Bearish exhaustion threshold
 MIN_NET_EDGE_CENTS = 6.0           # Minimum edge (in cents) AFTER Kalshi taker fees
 ALERT_COOLDOWN_SECONDS = 300       # 5m cooldown per contract ticker
+SLIPPAGE_BUFFER_CENTS = 1          # 1c buffer on button tap for immediate fill
 
 # Time-Decay Guardrails (minutes before expiration)
 MIN_MINUTES_15M = 3.5              # Skip last 3.5 mins of 15m windows
 MIN_MINUTES_1H = 10.0              # Skip last 10 mins of 1h windows
+
+
+# =====================================================================
+# KALSHI CRYPTOGRAPHIC AUTHENTICATION (Ed25519 & RSA-PSS)
+# =====================================================================
+def load_kalshi_private_key(raw_pem: str):
+    """
+    Normalizes single-line or multiline PEM strings from Render env vars
+    and loads either an Ed25519 or RSA private key.
+    """
+    if not raw_pem:
+        return None
+    cleaned = raw_pem.strip().strip('"').strip("'").replace("\\n", "\n")
+
+    # Reconstruct PEM line breaks if Render flattened the string into spaces
+    if "-----BEGIN" in cleaned and "\n" not in cleaned:
+        m = re.match(
+            r"(-----BEGIN [A-Z0-9 ]+-----)\s*(.+?)\s*(-----END [A-Z0-9 ]+-----)",
+            cleaned,
+        )
+        if m:
+            header, body, footer = m.groups()
+            body_clean = re.sub(r"\s+", "", body)
+            cleaned = f"{header}\n{body_clean}\n{footer}"
+
+    try:
+        return serialization.load_pem_private_key(
+            cleaned.encode("utf-8"), password=None
+        )
+    except Exception as e:
+        logger.error(f"Failed to parse KALSHI_PRIVATE_KEY: {e}")
+        return None
+
+
+PRIVATE_KEY_OBJ = load_kalshi_private_key(KALSHI_PRIVATE_KEY_RAW)
+
+
+def build_kalshi_auth_headers(method: str, path_with_prefix: str) -> dict:
+    """
+    Signs `timestamp_ms + METHOD + path_without_query` using Ed25519 or RSA-PSS.
+    """
+    if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
+        raise ValueError("Kalshi API credentials (KALSHI_KEY_ID / KALSHI_PRIVATE_KEY) not configured.")
+
+    path_clean = path_with_prefix.split("?")[0]
+    timestamp_ms = str(int(time.time() * 1000))
+    msg_bytes = f"{timestamp_ms}{method.upper()}{path_clean}".encode("utf-8")
+
+    if isinstance(PRIVATE_KEY_OBJ, ed25519.Ed25519PrivateKey):
+        sig_bytes = PRIVATE_KEY_OBJ.sign(msg_bytes)
+    elif isinstance(PRIVATE_KEY_OBJ, rsa.RSAPrivateKey):
+        sig_bytes = PRIVATE_KEY_OBJ.sign(
+            msg_bytes,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+    else:
+        raise ValueError("Unsupported private key type.")
+
+    signature_b64 = base64.b64encode(sig_bytes).decode("utf-8")
+    return {
+        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+        "KALSHI-ACCESS-SIGNATURE": signature_b64,
+        "Content-Type": "application/json",
+    }
+
+
+async def place_kalshi_order(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    outcome: str,
+    ask_cents: int,
+    contracts: int,
+) -> tuple[bool, str]:
+    """
+    Submits an Immediate-Or-Cancel limit order via Kalshi V2 (`/portfolio/events/orders`).
+    - Buying YES at `ask_cents` -> V2 `side: "bid"`, `price: ask_cents / 100`
+    - Buying NO  at `ask_cents` -> V2 `side: "ask"`, `price: (100 - ask_cents) / 100`
+    """
+    if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
+        return (
+            False,
+            "⚠️ <b>Missing Kalshi Credentials:</b> Add <code>KALSHI_KEY_ID</code> and <code>KALSHI_PRIVATE_KEY</code> in your Render Environment settings.",
+        )
+
+    capped_price_cents = min(99, max(1, ask_cents + SLIPPAGE_BUFFER_CENTS))
+
+    if outcome.upper() == "YES":
+        v2_side = "bid"
+        yes_price_dollars = capped_price_cents / 100.0
+    else:
+        # Buying NO at X cents is selling YES (ask) at (100 - X) cents on the YES book
+        v2_side = "ask"
+        yes_price_dollars = (100 - capped_price_cents) / 100.0
+
+    path = f"{KALSHI_API_PREFIX}/portfolio/events/orders"
+    url = f"{KALSHI_HOST}{path}"
+    payload = {
+        "ticker": ticker,
+        "client_order_id": str(uuid.uuid4()),
+        "side": v2_side,
+        "count": f"{contracts:.2f}",
+        "price": f"{yes_price_dollars:.4f}",
+        "time_in_force": "immediate_or_cancel",
+        "self_trade_prevention_type": "taker_at_cross",
+    }
+
+    try:
+        headers = build_kalshi_auth_headers("POST", path)
+        async with session.post(url, headers=headers, json=payload, timeout=8) as resp:
+            body_text = await resp.text()
+            if resp.status in (200, 201):
+                data = json.loads(body_text)
+                order_id = data.get("order_id", "N/A")
+                filled = data.get("fill_count", "0.00")
+                remaining = data.get("remaining_count", "0.00")
+                return (
+                    True,
+                    f"✅ <b>KALSHI ORDER SUBMITTED (IOC)</b>\n"
+                    f"<b>Ticker:</b> <code>{ticker}</code>\n"
+                    f"<b>Action:</b> BUY {contracts}x <b>{outcome.upper()}</b> (Limit ≤ {capped_price_cents}¢)\n"
+                    f"<b>Filled Contracts:</b> <code>{filled}</code> (Remaining: {remaining})\n"
+                    f"<b>Order ID:</b> <code>{order_id}</code>",
+                )
+            else:
+                return (
+                    False,
+                    f"❌ <b>Order Rejected (HTTP {resp.status}):</b>\n<code>{body_text[:300]}</code>",
+                )
+    except Exception as e:
+        return False, f"❌ <b>Execution Exception:</b> <code>{e}</code>"
+
+
+async def fetch_kalshi_balance(session: aiohttp.ClientSession) -> str:
+    """Checks Kalshi portfolio balance to verify API authentication."""
+    if not KALSHI_KEY_ID or PRIVATE_KEY_OBJ is None:
+        return "⚠️ <code>KALSHI_KEY_ID</code> or <code>KALSHI_PRIVATE_KEY</code> not set in Render."
+
+    path = f"{KALSHI_API_PREFIX}/portfolio/balance"
+    url = f"{KALSHI_HOST}{path}"
+    try:
+        headers = build_kalshi_auth_headers("GET", path)
+        async with session.get(url, headers=headers, timeout=6) as resp:
+            text = await resp.text()
+            if resp.status == 200:
+                data = json.loads(text)
+                # Handle both integer cents and dollar string representations
+                bal_raw = data.get("balance", 0)
+                if isinstance(bal_raw, (int, float)):
+                    bal_usd = bal_raw / 100.0
+                else:
+                    bal_usd = float(bal_raw)
+                return f"💰 <b>Kalshi Account Balance:</b> <code>${bal_usd:,.2f}</code>"
+            return f"⚠️ <b>Auth Error (HTTP {resp.status}):</b> <code>{text[:200]}</code>"
+    except Exception as e:
+        return f"⚠️ <b>Balance Check Error:</b> <code>{e}</code>"
 
 
 # =====================================================================
@@ -95,8 +273,7 @@ class CandleBuilder:
 def compute_rsi(closes: list[float], period: int = 7) -> float | None:
     if len(closes) < period + 1:
         return None
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(-period, 0):
         delta = closes[i] - closes[i - 1]
         if delta >= 0:
@@ -121,15 +298,11 @@ def compute_bollinger_bands(
     window = closes[-period:]
     sma = sum(window) / period
     std = statistics.pstdev(window)
-    upper = sma + (num_std * std)
-    lower = sma - (num_std * std)
-    return lower, sma, upper
+    return sma - (num_std * std), sma, sma + (num_std * std)
 
 
 def compute_realized_vol_per_min(closes: list[float]) -> float:
-    """Calculates per-minute log return standard deviation (with safe floor)."""
     if len(closes) < 10:
-        # Default fallback: ~15% annualized gold volatility scaled to 1 minute
         return 0.00025
     log_returns = [
         math.log(closes[i] / closes[i - 1])
@@ -138,15 +311,10 @@ def compute_realized_vol_per_min(closes: list[float]) -> float:
     ]
     if len(log_returns) < 5:
         return 0.00025
-    vol = statistics.pstdev(log_returns)
-    return max(vol, 0.00012)
+    return max(statistics.pstdev(log_returns), 0.00012)
 
 
 def detect_reversal_signal(candle_builder: CandleBuilder, label: str) -> dict:
-    """
-    Checks 1m or 5m candles for Bullish or Bearish mean-reversion setups.
-    Returns dict with direction ('BULLISH', 'BEARISH', or 'NEUTRAL') and reason.
-    """
     closes = candle_builder.get_closes()
     candles = candle_builder.get_all_candles()
     rsi = compute_rsi(closes, RSI_PERIOD)
@@ -165,12 +333,10 @@ def detect_reversal_signal(candle_builder: CandleBuilder, label: str) -> dict:
     prev_c = candles[-2]
     price = last_c["close"]
 
-    # Wick calculations for rejection confirmation
     candle_range = max(last_c["high"] - last_c["low"], 0.01)
     lower_wick = min(last_c["open"], last_c["close"]) - last_c["low"]
     upper_wick = last_c["high"] - max(last_c["open"], last_c["close"])
 
-    # 1. BULLISH REVERSAL: Oversold RSI + Lower BB touch/pierce + bounce/wick
     touched_lower_bb = last_c["low"] <= lower_bb or prev_c["low"] <= lower_bb
     bullish_bounce = (price > last_c["open"]) or (lower_wick / candle_range >= 0.45)
 
@@ -185,7 +351,6 @@ def detect_reversal_signal(candle_builder: CandleBuilder, label: str) -> dict:
             ),
         }
 
-    # 2. BEARISH REVERSAL: Overbought RSI + Upper BB touch/pierce + rejection
     touched_upper_bb = last_c["high"] >= upper_bb or prev_c["high"] >= upper_bb
     bearish_reject = (price < last_c["open"]) or (upper_wick / candle_range >= 0.45)
 
@@ -212,7 +377,6 @@ def detect_reversal_signal(candle_builder: CandleBuilder, label: str) -> dict:
 # BINARY FAIR-VALUE & KALSHI FEE MATH
 # =====================================================================
 def norm_cdf(x: float) -> float:
-    """Standard normal cumulative distribution function."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
@@ -224,19 +388,12 @@ def estimate_prob_above_strike(
     reversal_direction: str,
     bb_mid: float | None,
 ) -> float:
-    """
-    Calculates probability (0.0 to 1.0) that Gold finishes at or above `strike`.
-    Applies a slight mean-reversion drift toward the Bollinger midline when a
-    confirmed technical reversal triggers.
-    """
     if minutes_left <= 0 or spot <= 0 or strike <= 0:
         return 1.0 if spot >= strike else 0.0
-
     sigma_t = vol_per_min * math.sqrt(minutes_left)
     if sigma_t <= 1e-6:
         return 1.0 if spot >= strike else 0.0
 
-    # Mean-reversion drift adjustment (capped at 35% of distance to midline)
     expected_spot = spot
     if bb_mid is not None:
         if reversal_direction == "BULLISH" and bb_mid > spot:
@@ -249,16 +406,12 @@ def estimate_prob_above_strike(
 
 
 def kalshi_taker_fee_cents(price_cents: float) -> float:
-    """
-    Kalshi's taker fee formula on short-term series: 0.07 * P * (1 - P) dollars.
-    Returns the fee in cents per contract.
-    """
     p = max(0.01, min(0.99, price_cents / 100.0))
     return 0.07 * p * (1.0 - p) * 100.0
 
 
 # =====================================================================
-# BOT STATE & API CLIENTS
+# BOT STATE & MARKET DATA CLIENTS
 # =====================================================================
 class GoldAnalyzerState:
     def __init__(self):
@@ -276,10 +429,6 @@ STATE = GoldAnalyzerState()
 
 
 async def fetch_spot_gold_price(session: aiohttp.ClientSession) -> float | None:
-    """
-    Primary: Pyth Network Hermes v2 Metal.XAU/USD (exact Kalshi settlement source).
-    Fallback: Swissquote public XAU/USD feed if Hermes is unreachable.
-    """
     try:
         async with session.get(PYTH_HERMES_URL, timeout=4) as resp:
             if resp.status == 200:
@@ -296,7 +445,6 @@ async def fetch_spot_gold_price(session: aiohttp.ClientSession) -> float | None:
     except Exception as e:
         logger.debug(f"Pyth fetch warning: {e}")
 
-    # Fallback: Swissquote public XAU/USD quote
     try:
         fallback_url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
         async with session.get(fallback_url, timeout=4) as resp:
@@ -304,23 +452,20 @@ async def fetch_spot_gold_price(session: aiohttp.ClientSession) -> float | None:
                 data = await resp.json()
                 if data and "spreadProfilePrices" in data[0]:
                     prices = data[0]["spreadProfilePrices"][0]
-                    mid = ( float(prices["bid"]) + float(prices["ask"]) ) / 2.0
+                    mid = (float(prices["bid"]) + float(prices["ask"])) / 2.0
                     if mid > 500:
                         STATE.spot_source = "Swissquote XAU/USD (Fallback)"
                         return round(mid, 2)
     except Exception as e:
         logger.debug(f"Fallback gold fetch warning: {e}")
-
     return None
 
 
 def parse_strike_from_market(m: dict) -> float | None:
-    """Extracts numeric gold target strike from a Kalshi market object."""
     for key in ("floor_strike", "cap_strike", "strike_price", "custom_strike"):
         val = m.get(key)
         if isinstance(val, (int, float)) and val > 500:
             return float(val)
-    # Parse from subtitle or title if numeric field isn't populated
     text = f"{m.get('subtitle', '')} {m.get('yes_sub_title', '')} {m.get('title', '')}"
     cleaned = text.replace(",", "").replace("$", "")
     for token in cleaned.split():
@@ -346,239 +491,8 @@ def parse_minutes_remaining(m: dict) -> float | None:
 
 
 async def fetch_kalshi_gold_markets(session: aiohttp.ClientSession) -> list[dict]:
-    """Polls Kalshi public market endpoint for open 15m and 1h Gold markets."""
     markets = []
     for series in GOLD_SERIES_TICKERS:
         url = f"{KALSHI_BASE_URL}/markets?series_ticker={series}&status=open&limit=50"
         try:
-            async with session.get(url, timeout=6) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for m in data.get("markets", []):
-                        m["series_ticker"] = series
-                        markets.append(m)
-        except Exception as e:
-            logger.debug(f"Kalshi market fetch error ({series}): {e}")
-    return markets
-
-
-async def fetch_orderbook_best_asks(
-    session: aiohttp.ClientSession, ticker: str
-) -> dict | None:
-    """
-    Fetches Kalshi orderbook and computes implied YES Ask and NO Ask.
-    In Kalshi's binary order book:
-      - YES Ask = 100 - highest NO Bid
-      - NO Ask  = 100 - highest YES Bid
-    """
-    url = f"{KALSHI_BASE_URL}/markets/{ticker}/orderbook"
-    try:
-        async with session.get(url, timeout=5) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            ob = data.get("orderbook", {})
-            yes_bids = ob.get("yes") or []
-            no_bids = ob.get("no") or []
-
-            best_yes_bid = yes_bids[-1][0] if yes_bids else None
-            best_yes_bid_qty = yes_bids[-1][1] if yes_bids else 0
-
-            best_no_bid = no_bids[-1][0] if no_bids else None
-            best_no_bid_qty = no_bids[-1][1] if no_bids else 0
-
-            yes_ask = (100 - best_no_bid) if best_no_bid is not None else None
-            yes_ask_qty = best_no_bid_qty if best_no_bid is not None else 0
-
-            no_ask = (100 - best_yes_bid) if best_yes_bid is not None else None
-            no_ask_qty = best_yes_bid_qty if best_yes_bid is not None else 0
-
-            return {
-                "yes_bid": best_yes_bid,
-                "yes_ask": yes_ask,
-                "yes_ask_qty": yes_ask_qty,
-                "no_bid": best_no_bid,
-                "no_ask": no_ask,
-                "no_ask_qty": no_ask_qty,
-            }
-    except Exception as e:
-        logger.debug(f"Orderbook error for {ticker}: {e}")
-        return None
-
-
-# =====================================================================
-# TELEGRAM MESSAGING & COMMAND HANDLER
-# =====================================================================
-async def send_telegram_message(
-    session: aiohttp.ClientSession, text: str, chat_id: str | None = None
-):
-    target_chat = chat_id or TELEGRAM_CHAT_ID
-    if not TELEGRAM_TOKEN or not target_chat:
-        logger.warning("Telegram credentials missing; skipping message send.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": target_chat,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        async with session.post(url, json=payload, timeout=6) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logger.warning(f"Telegram API warning ({resp.status}): {body}")
-    except Exception as e:
-        logger.error(f"Failed to send Telegram message: {e}")
-
-
-def build_status_report() -> str:
-    spot_str = f"${STATE.latest_spot:,.2f}" if STATE.latest_spot else "Waiting..."
-    sig_1m = detect_reversal_signal(STATE.candles_1m, "1m")
-    sig_5m = detect_reversal_signal(STATE.candles_5m, "5m")
-
-    rsi_1m = f"{sig_1m['rsi']:.1f}" if sig_1m["rsi"] is not None else "Warming up"
-    rsi_5m = f"{sig_5m['rsi']:.1f}" if sig_5m["rsi"] is not None else "Warming up"
-
-    bb_1m_str = "Warming up"
-    if sig_1m["bb"]:
-        l_bb, m_bb, u_bb = sig_1m["bb"]
-        bb_1m_str = f"${l_bb:,.2f} / ${m_bb:,.2f} /${u_bb:,.2f}"
-
-    return (
-        f"<b>📊 KALSHI GOLD ANALYZER STATUS</b>\n"
-        f"<b>Spot Gold:</b> <code>{spot_str}</code> ({STATE.spot_source})\n"
-        f"<b>1m Candles Built:</b> {len(STATE.candles_1m.get_closes())}\n"
-        f"<b>1m RSI(7):</b> <code>{rsi_1m}</code> | <b>Signal:</b> {sig_1m['direction']}\n"
-        f"<b>1m Bollinger:</b> <code>{bb_1m_str}</code>\n"
-        f"<b>5m RSI(7):</b> <code>{rsi_5m}</code> | <b>Signal:</b> {sig_5m['direction']}\n"
-        f"<b>Open Kalshi Gold Markets:</b> {STATE.active_markets_count}\n\n"
-        f"<i>Commands:</i> /status | /markets | /test"
-    )
-
-
-async def poll_telegram_commands(session: aiohttp.ClientSession):
-    """Listens for /status, /markets, and /test commands from your phone."""
-    if not TELEGRAM_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"offset": STATE.last_telegram_update_id + 1, "timeout": 1}
-    try:
-        async with session.get(url, params=params, timeout=5) as resp:
-            if resp.status != 200:
-                return
-            data = await resp.json()
-            for item in data.get("result", []):
-                STATE.last_telegram_update_id = item["update_id"]
-                msg = item.get("message", {})
-                text = (msg.get("text") or "").strip().lower()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-                if not text or not chat_id:
-                    continue
-
-                if text.startswith("/status") or text.startswith("/start"):
-                    await send_telegram_message(session, build_status_report(), chat_id)
-
-                elif text.startswith("/test"):
-                    await send_telegram_message(
-                        session,
-                        "✅ <b>Test Alert Successful!</b>\nYour Kalshi Gold 15m/1h Reversal Scanner is online and connected.",
-                        chat_id,
-                    )
-
-                elif text.startswith("/markets"):
-                    markets = await fetch_kalshi_gold_markets(session)
-                    if not markets:
-                        await send_telegram_message(
-                            session,
-                            "ℹ️ No open <code>KXGOLD15M</code> or <code>KXGOLD1H</code> markets found right now (note: Kalshi 15m Gold markets pause over the weekend).",
-                            chat_id,
-                        )
-                    else:
-                        lines = ["<b>🏅 ACTIVE KALSHI GOLD MARKETS</b>"]
-                        for m in markets[:8]:
-                            tkr = m.get("ticker")
-                            strike = parse_strike_from_market(m)
-                            mins = parse_minutes_remaining(m)
-                            s_str = f"${strike:,.2f}" if strike else "N/A"
-                            m_str = f"{mins:.1f}m" if mins is not None else "N/A"
-                            lines.append(f"• <code>{tkr}</code> | Strike: <b>{s_str}</b> | Closes: {m_str}")
-                        await send_telegram_message(session, "\n".join(lines), chat_id)
-    except Exception as e:
-        logger.debug(f"Telegram poll error: {e}")
-
-
-# =====================================================================
-# CORE SCANNER & OPPORTUNITY ENGINE
-# =====================================================================
-async def evaluate_markets_and_alert(session: aiohttp.ClientSession):
-    spot = STATE.latest_spot
-    if spot is None:
-        return
-
-    sig_1m = detect_reversal_signal(STATE.candles_1m, "1m")
-    sig_5m = detect_reversal_signal(STATE.candles_5m, "5m")
-
-    # Prioritize 1m signal for 15m markets, or 5m signal if active
-    active_signal = sig_1m if sig_1m["direction"] != "NEUTRAL" else sig_5m
-    direction = active_signal["direction"]
-
-    markets = await fetch_kalshi_gold_markets(session)
-    STATE.active_markets_count = len(markets)
-
-    if direction == "NEUTRAL" or not markets:
-        return
-
-    vol_per_min = compute_realized_vol_per_min(STATE.candles_1m.get_closes())
-    bb_mid = active_signal["bb"][1] if active_signal["bb"] else None
-    now_ts = time.time()
-
-    for m in markets:
-        ticker = m.get("ticker", "")
-        series = m.get("series_ticker", "")
-        if not ticker:
-            continue
-
-        # Check alert cooldown per contract
-        if now_ts - STATE.last_alerts.get(ticker, 0) < ALERT_COOLDOWN_SECONDS:
-            continue
-
-        strike = parse_strike_from_market(m)
-        mins_left = parse_minutes_remaining(m)
-        if strike is None or mins_left is None:
-            continue
-
-        # Enforce Time-Decay Guardrails
-        if "15M" in series and (mins_left < MIN_MINUTES_15M or mins_left > 16.0):
-            continue
-        if "1H" in series and (mins_left < MIN_MINUTES_1H or mins_left > 65.0):
-            continue
-
-        ob = await fetch_orderbook_best_asks(session, ticker)
-        if not ob:
-            continue
-
-        prob_yes = estimate_prob_above_strike(
-            spot=spot,
-            strike=strike,
-            minutes_left=mins_left,
-            vol_per_min=vol_per_min,
-            reversal_direction=direction,
-            bb_mid=bb_mid,
-        )
-        fair_yes_cents = prob_yes * 100.0
-        fair_no_cents = (1.0 - prob_yes) * 100.0
-
-        # Evaluate BULLISH reversal -> Look for cheap YES ask
-        if direction == "BULLISH" and ob["yes_ask"] is not None:
-            ask_cents = float(ob["yes_ask"])
-            fee_cents = kalshi_taker_fee_cents(ask_cents)
-            net_edge = fair_yes_cents - ask_cents - fee_cents
-
-            if net_edge >= MIN_NET_EDGE_CENTS and 8 <= ask_cents <= 85:
-                STATE.last_alerts[ticker] = now_ts
-                alert_msg = (
-                    f"🟢 <b>BULLISH GOLD REVERSAL — BUY YES</b>\n"
-                    f"<b>Contract:</b> <code>{ticker}</code> ({mins_left:.1f}m left)\n"
-                    f"<b>Target Strike:</b> <code>${strike:,.2f}</code> \vert{} <b>Spot:</b> <code>${spot:,.2f}</code>\n"
-                    f"<b>Trigger:</b> {active_
+            async with session.get(url, timeout=
