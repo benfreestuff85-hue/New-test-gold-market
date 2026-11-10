@@ -177,11 +177,14 @@ class CandleBuilder:
             if self.current_candle is not None:
                 self.candles.append(self.current_candle)
             self.current_bucket = bucket
-            self.current_candle = {"timestamp": bucket, "open": price, "high": price, "low": price, "close": price}
+            self.current_candle = {"timestamp": bucket, "open": price, "high": price, "low": price,
+                                   "close": price, "last_sample_ts": ts, "sample_count": 1}
         else:
             self.current_candle["high"] = max(self.current_candle["high"], price)
             self.current_candle["low"] = min(self.current_candle["low"], price)
             self.current_candle["close"] = price
+            self.current_candle["last_sample_ts"] = ts
+            self.current_candle["sample_count"] = self.current_candle.get("sample_count", 0) + 1
 
     def get_closes(self) -> list[float]:
         closes = [c["close"] for c in self.candles]
@@ -435,6 +438,7 @@ async def fetch_kalshi_gold_markets(session):
 
 
 async def fetch_orderbook_details(session: aiohttp.ClientSession, ticker: str) -> dict | None:
+    """Fetch executable best quotes plus top-five depth for imbalance/microprice features."""
     url = f"{KALSHI_BASE_URL}/markets/{ticker}/orderbook"
     try:
         async with session.get(url, timeout=5) as resp:
@@ -442,34 +446,31 @@ async def fetch_orderbook_details(session: aiohttp.ClientSession, ticker: str) -
                 return None
             data = await resp.json()
             ob = data.get("orderbook_fp") or data.get("orderbook", {})
-
             yd, nd = ob.get("yes_dollars"), ob.get("no_dollars")
-            if yd: yd = sorted(yd, key=lambda level: float(level[0]))
-            if nd: nd = sorted(nd, key=lambda level: float(level[0]))
             if yd is not None or nd is not None:
-                yes_bid = float(yd[-1][0]) * 100 if yd else None
-                yes_qty = float(yd[-1][1]) if yd else 0
-                no_bid = float(nd[-1][0]) * 100 if nd else None
-                no_qty = float(nd[-1][1]) if nd else 0
+                yraw = [(float(p)*100, float(q)) for p,q in (yd or [])]
+                nraw = [(float(p)*100, float(q)) for p,q in (nd or [])]
             else:
-                yb, nb = ob.get("yes") or [], ob.get("no") or []
-                yes_bid = int(yb[-1][0]) if yb else None
-                yes_qty = yb[-1][1] if yb else 0
-                no_bid = int(nb[-1][0]) if nb else None
-                no_qty = nb[-1][1] if nb else 0
-
-            yes_ask = (100 - no_bid) if no_bid is not None else None
-            no_ask = (100 - yes_bid) if yes_bid is not None else None
-            spread = (yes_ask - yes_bid) if (yes_ask is not None and yes_bid is not None) else 99.0
-
+                yraw = [(float(p), float(q)) for p,q in (ob.get("yes") or [])]
+                nraw = [(float(p), float(q)) for p,q in (ob.get("no") or [])]
+            yraw = sorted(yraw, key=lambda x:x[0])
+            nraw = sorted(nraw, key=lambda x:x[0])
+            yes_bid_levels = list(reversed(yraw[-5:]))
+            # A NO bid is an implied YES ask at 100-NO bid.
+            yes_ask_levels = sorted([(100-p,q) for p,q in nraw], key=lambda x:x[0])[:5]
+            yes_bid = yes_bid_levels[0][0] if yes_bid_levels else None
+            no_bid = nraw[-1][0] if nraw else None
+            yes_ask = (100-no_bid) if no_bid is not None else None
+            no_ask = (100-yes_bid) if yes_bid is not None else None
+            spread = (yes_ask-yes_bid) if yes_ask is not None and yes_bid is not None else 99.0
             return {
-                "yes_bid": yes_bid,
-                "yes_ask": yes_ask,
-                "yes_ask_qty": no_qty if no_bid is not None else 0,
-                "no_bid": no_bid,
-                "no_ask": no_ask,
-                "no_ask_qty": yes_qty if yes_bid is not None else 0,
-                "spread": spread,
+                "yes_bid":yes_bid,"yes_ask":yes_ask,
+                "yes_ask_qty":yes_ask_levels[0][1] if yes_ask_levels else 0,
+                "no_bid":no_bid,"no_ask":no_ask,
+                "no_ask_qty":yes_bid_levels[0][1] if yes_bid_levels else 0,
+                "spread":spread,"yes_bid_levels":yes_bid_levels,
+                "yes_ask_levels":yes_ask_levels,
+                "book_received_ts":time.time(),
             }
     except Exception:
         return None
@@ -633,6 +634,7 @@ async def worker_context(app: web.Application):
     task.cancel()
     commands.cancel()
     await asyncio.gather(task, commands, return_exceptions=True)
+    MONITOR.log.close()
 
 
 def create_app() -> web.Application:

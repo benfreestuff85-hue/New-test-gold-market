@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS markets(
 CREATE TABLE IF NOT EXISTS forecasts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, ticker TEXT, minutes INTEGER, spot REAL,
   strike REAL, seconds_left INTEGER, sigma_min REAL, p_yes REAL, momentum REAL,
-  yes_bid REAL, yes_ask REAL, feed_age REAL);
+  yes_bid REAL, yes_ask REAL, feed_age REAL,
+  volatility_regime TEXT, regime_ratio REAL, momentum_z REAL, acceleration_z REAL,
+  jump_z REAL, jump_detected INTEGER, depth_imbalance REAL, microprice_offset REAL);
 CREATE INDEX IF NOT EXISTS forecasts_ticker ON forecasts(ticker);
 """
 
@@ -53,11 +55,33 @@ class ForecastLog:
             try:
                 self.db = sqlite3.connect(self.path)
                 self.db.executescript(SCHEMA)
+                # Safe additive migrations for existing SQLite files.
+                existing = {r[1] for r in self.db.execute("PRAGMA table_info(forecasts)")}
+                additions = {
+                    "volatility_regime":"TEXT", "regime_ratio":"REAL", "momentum_z":"REAL",
+                    "acceleration_z":"REAL", "jump_z":"REAL", "jump_detected":"INTEGER",
+                    "depth_imbalance":"REAL", "microprice_offset":"REAL",
+                }
+                for name, typ in additions.items():
+                    if name not in existing:
+                        self.db.execute(f"ALTER TABLE forecasts ADD COLUMN {name} {typ}")
+                self.db.commit()
             except Exception as exc:
                 logger.warning("Forecast log disabled (%s): %s", self.path, exc)
                 self.disabled = True
                 self.db = None
         return self.db
+
+    def close(self):
+        """Flush and close the SQLite connection during orderly shutdown."""
+        if self.db is not None:
+            try:
+                self.db.commit()
+                self.db.close()
+            except Exception as exc:
+                logger.warning("Forecast log close failed: %s", exc)
+            finally:
+                self.db = None
 
     def record(self, market, row, sigma_min, spot, feed_age, now, end_ts):
         """Register the contract and, if the model produced a probability, log one forecast."""
@@ -80,10 +104,14 @@ class ForecastLog:
                 quotes = row.get("quotes") or {}
                 db.execute(
                     "INSERT INTO forecasts(ts,ticker,minutes,spot,strike,seconds_left,sigma_min,p_yes,momentum,"
-                    "yes_bid,yes_ask,feed_age) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "yes_bid,yes_ask,feed_age,volatility_regime,regime_ratio,momentum_z,acceleration_z,jump_z,"
+                    "jump_detected,depth_imbalance,microprice_offset) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (now, ticker, row["minutes"], spot, row.get("target"), row.get("seconds_left"), sigma_min,
                      row["yes_score"] / 100.0, row.get("momentum"), quotes.get("yes_bid"), quotes.get("yes_ask"),
-                     feed_age),
+                     feed_age, row.get("volatility_regime"), row.get("regime_ratio"), row.get("momentum_z"),
+                     row.get("acceleration_z"), row.get("jump_z"), int(bool(row.get("jump_detected"))),
+                     (row.get("orderbook") or {}).get("depth_imbalance"),
+                     (row.get("orderbook") or {}).get("microprice_offset")),
                 )
                 self.last[ticker] = now
                 if len(self.last) > 500:
@@ -172,13 +200,13 @@ class ForecastLog:
                         line += f" [n<{MIN_SAMPLE}: too few]"
                     out.append(line)
             end, start, flips, checked = [], [], 0, 0
-            for kind, ev, strike, ps, pe, result in db.execute(
-                "SELECT strike_type,expiration_value,settle_strike,proxy_start,proxy_end,result FROM markets"
+            for minutes, kind, ev, strike, ps, pe, result in db.execute(
+                "SELECT minutes,strike_type,expiration_value,settle_strike,proxy_start,proxy_end,result FROM markets"
                 " WHERE result IN ('yes','no')"
             ):
                 if ev is not None and pe is not None:
                     end.append(pe - ev)
-                if strike is not None and ps is not None:
+                if minutes == 15 and strike is not None and ps is not None:
                     start.append(ps - strike)
                 if strike is not None and pe is not None and kind:
                     above = pe > strike if kind.startswith("greater") else pe < strike
@@ -186,7 +214,8 @@ class ForecastLog:
                     flips += (("yes" if above else "no") != result)
             out += ["", "Proxy minus Kalshi settlement values (basis):",
                     "end   (proxy close vs expiration_value): " + self._stats(end),
-                    "start (proxy close vs floor_strike):     " + self._stats(start),
+                    "15m start (proxy close vs opening strike): " + self._stats(start),
+                    "(Hourly fixed strikes are excluded from the 15m start-basis statistic.)",
                     f"Proxy end price on the wrong side of the strike vs official result: {flips}/{checked}"]
             if total == 0 and not end:
                 out.append("No settled markets logged yet. Keep the bot running.")
@@ -202,12 +231,16 @@ class ForecastLog:
         writer = csv.writer(buf)
         writer.writerow(["ts", "ticker", "minutes", "spot", "strike", "seconds_left", "sigma_min", "p_yes",
                          "momentum", "yes_bid", "yes_ask", "feed_age", "result", "expiration_value",
-                         "settle_strike", "proxy_start", "proxy_end"])
+                         "settle_strike", "proxy_start", "proxy_end", "volatility_regime", "regime_ratio",
+                         "momentum_z", "acceleration_z", "jump_z", "jump_detected", "depth_imbalance",
+                         "microprice_offset"])
         try:
             writer.writerows(db.execute(
                 "SELECT f.ts,f.ticker,f.minutes,f.spot,f.strike,f.seconds_left,f.sigma_min,f.p_yes,f.momentum,"
                 "f.yes_bid,f.yes_ask,f.feed_age,m.result,m.expiration_value,m.settle_strike,m.proxy_start,"
-                "m.proxy_end FROM forecasts f LEFT JOIN markets m ON m.ticker=f.ticker ORDER BY f.id DESC LIMIT ?",
+                "m.proxy_end,f.volatility_regime,f.regime_ratio,f.momentum_z,f.acceleration_z,f.jump_z,"
+                "f.jump_detected,f.depth_imbalance,f.microprice_offset FROM forecasts f "
+                "LEFT JOIN markets m ON m.ticker=f.ticker ORDER BY f.id DESC LIMIT ?",
                 (limit,),
             ))
         except Exception as exc:

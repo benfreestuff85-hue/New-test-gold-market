@@ -1,9 +1,16 @@
+test_15m_features_include_momentum_and_acceleration (test_gold_model.GoldModelTests.test_15m_features_include_momentum_and_acceleration) ... ok
+test_book_adjustment_is_bounded_and_changes_probability (test_gold_model.GoldModelTests.test_book_adjustment_is_bounded_and_changes_probability) ... ok
+test_hourly_does_not_forge_full_horizon_from_short_history (test_gold_model.GoldModelTests.test_hourly_does_not_forge_full_horizon_from_short_history) ... ok
+test_hourly_uses_five_minute_history (test_gold_model.GoldModelTests.test_hourly_uses_five_minute_history) ... ok
+test_jump_detection (test_gold_model.GoldModelTests.test_jump_detection) ... ok
+test_top_five_depth_imbalance (test_gold_model.GoldModelTests.test_top_five_depth_imbalance) ... ok
 test_momentum_alerts_off_by_default (test_update.AlertTests.test_momentum_alerts_off_by_default) ... ok
 test_no_alert_in_final_minutes (test_update.AlertTests.test_no_alert_in_final_minutes) ... ok
 test_reversal_alert_fires_with_time_left (test_update.AlertTests.test_reversal_alert_fires_with_time_left) ... ok
 test_basis_uncertainty_limits_confidence (test_update.ForecastTests.test_basis_uncertainty_limits_confidence) ... ok
 test_expiry_prefers_close_time_over_latest_expiration (test_update.ForecastTests.test_expiry_prefers_close_time_over_latest_expiration) ... ok
 test_gap_does_not_blank_model_or_hourly_lookback_warmup (test_update.ForecastTests.test_gap_does_not_blank_model_or_hourly_lookback_warmup) ... ok
+test_hourly_selected_strike_is_pinned_until_contract_ends (test_update.ForecastTests.test_hourly_selected_strike_is_pinned_until_contract_ends) ... ok
 test_implausible_expiry_withheld (test_update.ForecastTests.test_implausible_expiry_withheld) ... ok
 test_invalid_symbol (test_update.ForecastTests.test_invalid_symbol) ... ok
 test_nan_threshold (test_update.ForecastTests.test_nan_threshold) ... ok
@@ -13,48 +20,47 @@ test_positive_gauge (test_update.ForecastTests.test_positive_gauge) ... ok
 test_precision (test_update.ForecastTests.test_precision) ... ok
 test_probability_zero_drift_and_clamped (test_update.ForecastTests.test_probability_zero_drift_and_clamped) ... ok
 test_stale_feed (test_update.ForecastTests.test_stale_feed) ... ok
-test_trend_does_not_move_probability (test_update.ForecastTests.test_trend_does_not_move_probability) ... ok
+test_trend_feature_moves_probability_with_bounded_drift (test_update.ForecastTests.test_trend_feature_moves_probability_with_bounded_drift) ... ok
 test_vol_close_to_close_and_gap_tolerant (test_update.ForecastTests.test_vol_close_to_close_and_gap_tolerant) ... ok
-test_dashboard_auth (test_update.HTTPTests.test_dashboard_auth) ... /usr/local/lib/python3.13/site-packages/aiosignal/__init__.py:52: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f54075a06d0>
-  await receiver(*args, **kwargs)
+test_dashboard_auth (test_update.HTTPTests.test_dashboard_auth) ... <frozen abc>:107: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf95e47c0>
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/usr/local/lib/python3.13/site-packages/aiosignal/__init__.py:52: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f54075a0b80>
-  await receiver(*args, **kwargs)
+<frozen abc>:107: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf95e4f40>
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ok
-test_integrated_bot (test_update.HTTPTests.test_integrated_bot) ... 2026-11-09 12:31:02,012 [WARNING] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set: alerts and commands are disabled.
+test_integrated_bot (test_update.HTTPTests.test_integrated_bot) ... 2026-11-09 22:58:00,470 [WARNING] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID not set: alerts and commands are disabled.
 ok
-test_log_endpoint_requires_token (test_update.HTTPTests.test_log_endpoint_requires_token) ... 2026-11-09 12:31:02,014 [INFO] <Server sockets=(<asyncio.TransportSocket fd=6, family=2, type=1, proto=0, laddr=('127.0.0.1', 44959)>,)> is serving
-2026-11-09 12:31:02,018 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /api/log HTTP/1.1" 401 180 "-" "Python/3.13 aiohttp/3.14.5"
-2026-11-09 12:31:02,019 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /api/log HTTP/1.1" 200 331 "-" "Python/3.13 aiohttp/3.14.5"
+test_log_endpoint_requires_token (test_update.HTTPTests.test_log_endpoint_requires_token) ... 2026-11-09 22:58:00,471 [INFO] <Server sockets=(<asyncio.TransportSocket fd=6, family=2, type=1, proto=0, laddr=('127.0.0.1', 42319)>,)> is serving
+2026-11-09 22:58:00,474 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /api/log HTTP/1.1" 401 180 "-" "Python/3.13 aiohttp/3.13.3"
+2026-11-09 22:58:00,476 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /api/log HTTP/1.1" 200 443 "-" "Python/3.13 aiohttp/3.13.3"
 ok
-test_sell_http_local_mock (test_update.HTTPTests.test_sell_http_local_mock) ... 2026-11-09 12:31:02,024 [INFO] <Server sockets=(<asyncio.TransportSocket fd=6, family=2, type=1, proto=0, laddr=('127.0.0.1', 34133)>,)> is serving
-2026-11-09 12:31:02,031 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /trade-api/v2/markets/KXGOLD15M-26NOV09-A HTTP/1.1" 200 494 "-" "Python/3.13 aiohttp/3.14.5"
-2026-11-09 12:31:02,032 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /trade-api/v2/portfolio/positions?ticker=KXGOLD15M-26NOV09-A&count_filter=position&limit=100 HTTP/1.1" 200 262 "-" "Python/3.13 aiohttp/3.14.5"
-2026-11-09 12:31:02,034 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /trade-api/v2/markets/KXGOLD15M-26NOV09-A/orderbook HTTP/1.1" 200 242 "-" "Python/3.13 aiohttp/3.14.5"
-2026-11-09 12:31:02,035 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "POST /trade-api/v2/portfolio/events/orders HTTP/1.1" 201 266 "-" "Python/3.13 aiohttp/3.14.5"
-2026-11-09 12:31:02,037 [INFO] 127.0.0.1 [09/Nov/2026:12:31:02 -0800] "GET /trade-api/v2/portfolio/positions?ticker=KXGOLD15M-26NOV09-A&count_filter=position&limit=100 HTTP/1.1" 200 262 "-" "Python/3.13 aiohttp/3.14.5"
+test_sell_http_local_mock (test_update.HTTPTests.test_sell_http_local_mock) ... 2026-11-09 22:58:00,479 [INFO] <Server sockets=(<asyncio.TransportSocket fd=6, family=2, type=1, proto=0, laddr=('127.0.0.1', 39057)>,)> is serving
+2026-11-09 22:58:00,482 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /trade-api/v2/markets/KXGOLD15M-26NOV09-A HTTP/1.1" 200 494 "-" "Python/3.13 aiohttp/3.13.3"
+2026-11-09 22:58:00,484 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /trade-api/v2/portfolio/positions?ticker=KXGOLD15M-26NOV09-A&count_filter=position&limit=100 HTTP/1.1" 200 262 "-" "Python/3.13 aiohttp/3.13.3"
+2026-11-09 22:58:00,485 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /trade-api/v2/markets/KXGOLD15M-26NOV09-A/orderbook HTTP/1.1" 200 242 "-" "Python/3.13 aiohttp/3.13.3"
+2026-11-09 22:58:00,488 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "POST /trade-api/v2/portfolio/events/orders HTTP/1.1" 201 266 "-" "Python/3.13 aiohttp/3.13.3"
+2026-11-09 22:58:00,490 [INFO] 127.0.0.1 [09/Nov/2026:22:58:00 +0000] "GET /trade-api/v2/portfolio/positions?ticker=KXGOLD15M-26NOV09-A&count_filter=position&limit=100 HTTP/1.1" 200 262 "-" "Python/3.13 aiohttp/3.13.3"
 ok
 test_calibration_brier_vs_kalshi_mid (test_update.LogTests.test_calibration_brier_vs_kalshi_mid) ... ok
-test_log_failure_never_raises (test_update.LogTests.test_log_failure_never_raises) ... 2026-11-09 12:31:02,042 [WARNING] Forecast log disabled (/nonexistent-dir/x.db): unable to open database file
+test_log_failure_never_raises (test_update.LogTests.test_log_failure_never_raises) ... 2026-11-09 22:58:00,497 [WARNING] Forecast log disabled (/nonexistent-dir/x.db): unable to open database file
 ok
 test_rows_without_probability_not_logged_and_throttled (test_update.LogTests.test_rows_without_probability_not_logged_and_throttled) ... ok
 test_series_failure_does_not_break_refresh (test_update.LogTests.test_series_failure_does_not_break_refresh) ... ok
 test_series_terms_and_fee_multiplier (test_update.LogTests.test_series_terms_and_fee_multiplier) ... ok
 test_settle_records_official_result_value_and_proxy_basis (test_update.LogTests.test_settle_records_official_result_value_and_proxy_basis) ... ok
+test_settlement_proxy_close_rejects_stale_minute_sample (test_update.LogTests.test_settlement_proxy_close_rejects_stale_minute_sample) ... ok
 test_unpublished_result_stays_pending (test_update.LogTests.test_unpublished_result_stays_pending) ... ok
 test_button_payload_size (test_update.SelectorTests.test_button_payload_size) ... ok
 test_choose_no_no_order (test_update.SelectorTests.test_choose_no_no_order) ... ok
-test_choose_yes_no_order (test_update.SelectorTests.test_choose_yes_no_order) ... /usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f54075a0a90>
+test_choose_yes_no_order (test_update.SelectorTests.test_choose_yes_no_order) ... /usr/lib/python3.13/unittest/mock.py:2247: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf95e5c60>
   def __init__(self, name, parent):
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f54075a1120>
+/usr/lib/python3.13/unittest/mock.py:2247: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf95e64d0>
   def __init__(self, name, parent):
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f540725d4e0>
+/usr/lib/python3.13/unittest/mock.py:2247: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf92797b0>
   def __init__(self, name, parent):
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
-/usr/local/lib/python3.13/unittest/mock.py:2253: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f540725ce50>
+/usr/lib/python3.13/unittest/mock.py:2247: ResourceWarning: unclosed database in <sqlite3.Connection object at 0x7f4bf9279990>
   def __init__(self, name, parent):
 ResourceWarning: Enable tracemalloc to get the object allocation traceback
 ok
@@ -100,6 +106,6 @@ test_zero_fill (test_update.TradeTests.test_zero_fill) ... ok
 test_zero_position_no_order (test_update.TradeTests.test_zero_position_no_order) ... ok
 
 ----------------------------------------------------------------------
-Ran 71 tests in 0.179s
+Ran 79 tests in 0.176s
 
 OK

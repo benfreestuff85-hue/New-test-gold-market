@@ -1,37 +1,35 @@
-# Complete gold bot — zero-drift forecasts, separate hourly, settlement logger
+# Gold forecast bot — independent 15m / 1h engines, free data, paper-first
 
-## What changed in THIS update (read first)
-Why: a simulation of the previous model (random-walk gold, efficient market) showed the 15m and 1h
-rows shared one drift/volatility input, and the drift extrapolation made probabilities badly
-overconfident (Brier 0.221 vs 0.180 ideal; "97%" calls came true 81% of the time).
-* Probability model (both markets): zero drift, P(YES)=Φ((ln(S/K) − σ²T/2)/√(σ²T + basis²)),
-  K = the contract's structured strike (floor/cap). Clamped to 2–98. No drift extrapolation, no "projected finish".
-  Re-simulated on this code: Brier within 0.0006 of ideal; "edge ≥ 6¢" fake alerts fell from ~60% of samples to ~0.1%.
-  Simulation assumes a random walk and an efficient market; real gold has jumps. Judge it with /calibration, not with this.
-* Volatility: RMS close-to-close per-minute log return (the old open→close version under-measured: 0.80× true at 20 s feeds),
-  ×GOLD_VOL_MULT (default 1.1), floor GOLD_VOL_FLOOR. Gap-tolerant: a missing minute no longer blanks the model for an hour.
-* Hourly is now its own forecast: own contract, strike, time left and its own 5-minute-candle volatility
-  (1m-candle fallback while 5m history warms up). It shows target/YES-NO/score like the 15m. Still NO hourly trade controls.
-  They remain correlated because both track the same gold price; the strike, time left and volatility window differ.
-* Momentum gauge: display only. Needs a FULL lookback (15 min / 60 min) of history; no truncated "1h" gauge after startup.
-  Momentum-threshold ALERTS are OFF by default (MOMENTUM_ALERTS=true to re-enable). Reversal+edge alerts remain.
-* Restored the minimum-time gate lost in the earlier rewrite: no alert with < MIN_MINUTES_15M (3.5 min) left;
-  /predict warns "final minutes" under the limit (hourly: MIN_MINUTES_1H).
-* Expiry time order is now expected_expiration_time → close_time → expiration_time (the latter can be hours after the
-  window). A 15m/1h contract whose expiry is implausibly far away is withheld, not forecast. Verify with the logs.
-* Candle history resets after a 300 s feed gap (was 120 s).
-* NEW forecast_log.py (SQLite): logs a forecast every 30 s per selected contract and, after Kalshi publishes the result,
-  records result, expiration_value, floor_strike and OUR proxy's 1-minute candle closes at window start/end.
-  /calibration = model vs Kalshi-mid Brier at fixed lead times plus proxy-vs-Kalshi basis. Needs ~30+ settled markets to mean anything.
-* NEW /source: shows settlement_sources, contract terms URL and fee settings straight from Kalshi's series data.
-  VERIFY the settlement source there; the "Pyth 1-minute candle close vs the start candle close" description came from a
-  third-party site and is unconfirmed. Kalshi's fee_multiplier (if quadratic) now scales the 7% fee.
-* NEW GET /api/log (Bearer DASHBOARD_TOKEN) downloads the log as CSV.
-* GOLD_BASIS_USD (default 0.75, a guess) = 1σ proxy-vs-index error. Replace it with the sd from /calibration "end" basis.
-* The SQLite file is on Render's ephemeral disk: it is lost on redeploy/restart unless FORECAST_DB points at a persistent disk.
-  Download /api/log before redeploying.
-Not changed: trade_controls.py, order/sell logic, owner binding, selector UI. Legacy estimate_prob_above_strike and
-compute_realized_vol_per_min in bot.py are now unused (kept to keep the diff small).
+## Current update
+
+This update replaces the prior zero-drift/display-only momentum implementation with a transparent, bounded feature model. It is still **research software**, not a validated profitable strategy.
+
+### Forecast engines
+- **15-minute:** sampled 1-minute Gold-API spot candles; close-to-close realized volatility, short/medium momentum, acceleration, robust jump detection, and volatility regime.
+- **1-hour:** its own 5-minute candles and 1-hour contract/strike. It falls back to 1-minute candles while 5-minute history warms up, and refuses to call a 30-minute sample a full hourly forecast.
+- The engines share utility functions, not horizon inputs. Both remain correlated because they observe the same underlying gold market.
+- Probability combines log-distance to the contract strike, remaining time, volatility-regime adjustment, a bounded momentum drift prior, and jump-risk volatility inflation. Probabilities are clamped to 2–98%.
+- **Order book:** captures best quotes and up to five levels per side. A small bounded adjustment uses top-five depth imbalance and microprice offset. This is a single-snapshot feature, not a learned order-flow model; it can be noisy.
+- Feature values, regime, acceleration, jump z-score, and order-book metrics are logged with forecast snapshots and included in CSV export.
+
+### Critical data limitation
+- Live underlying input remains free Gold-API XAU/USD spot. Public reporting for KXGOLD15M identifies Pyth `Metal.Index.1OZGOLD/USD`, but this package does not subscribe to that feed or prove the current per-series feed ID from a live rules response. KXGOLDH must be checked independently. The Gold-API input is **not** the contractual Pyth index, so forecasts are a proxy model, not exact settlement replication.
+- The bot fetches Kalshi series settlement-source metadata and official market result/expiration value after settlement. That verifies outcomes but does not provide a real-time exact Pyth observation. Sampled proxy candle closes are now accepted for basis diagnostics only when the last sample is within 20 seconds of the minute boundary; this still does not make them Pyth candle closes.
+- No paid data subscription is added. Do not substitute another Pyth feed ID without verifying the exact series `settlement_sources` and contract terms from Kalshi.
+- `GOLD_BASIS_USD=0.75` remains an uncalibrated placeholder for proxy/index uncertainty. Do not regard probabilities as calibrated until basis residuals are measured from a sufficiently large, time-aligned sample.
+
+### Evaluation and trading safety
+- SQLite logs model probability, Kalshi bid/ask mid, feature diagnostics, and official settlement. `/calibration` reports Brier score at fixed lead times and proxy-vs-settlement diagnostics. Download `/api/log` before redeploy if storage is ephemeral.
+- Hourly fixed-strike contracts are excluded from the 15-minute opening-strike basis statistic; these are different contract structures.
+- Existing reversal/edge alerts remain alerts only. Feature weights are heuristic, not fitted. Run chronological walk-forward tests, final-minute replay, regime-sliced Brier/log-loss, and paper execution before considering live use.
+- `ENABLE_LIVE_ORDERS=false` remains the default. **Keep it false.** No live deployment or order was made by this update. Existing manual 15m trade controls remain in the package, but must not be enabled during model testing.
+- The paper tracker is not actual fill accounting and does not establish profitability. Fees, slippage, partial fills, and actual execution must be measured separately.
+
+## Tests
+The package includes unit tests for trading gates, selectors, logging, independent horizon warm-up, regime/jump features, and top-five order-book calculations. Passing tests checks software behavior only; it does not establish forecast quality.
+
+## Deploy
+Replace the files in your repository with this ZIP as a complete set. Python 3.10+ is required. Render build: `python -m pip install -r requirements.txt`; start: `python bot.py`. Keep API credentials in Render environment variables, never in source control. No paid resources are created by this package.
 
 # (Earlier README follows; superseded where it conflicts with the section above)
 
@@ -47,7 +45,7 @@ Render Build Command: python -m pip install -r requirements.txt
 Render Start Command: python bot.py
 Commit the files, then deploy latest commit. Do not paste shell commands into Python.
 Keep Telegram/Kalshi keys in Render Environment, not source control.
-Existing DASHBOARD_TOKEN works. New optional env: GOLD_VOL_MULT, GOLD_VOL_FLOOR, GOLD_BASIS_USD, MOMENTUM_ALERTS, FORECAST_DB. No paid Pyth subscription or gold feed API key.
+Existing DASHBOARD_TOKEN works. New optional env: GOLD_VOL_FLOOR, GOLD_BASIS_USD, MOMENTUM_ALERTS, FORECAST_DB. No paid Pyth subscription or gold feed API key.
 ENABLE_LIVE_ORDERS defaults false; keep false during deployment/demo testing.
 The package does NOT reset existing Render environment values (including true).
 
@@ -122,10 +120,10 @@ not guaranteed. A prior public response was stale; verify freshness in your depl
 Provider timestamps build candles; repeated timestamp does not fabricate new observations.
 >300s gaps reset 1m/5m histories; missing single minutes are tolerated.
 ~20 completed 1m candles warm-up (hourly: 12 completed 5m candles, 1m fallback before). Gauges need a full lookback.
-Zero-drift normal model with proxy-basis uncertainty; scores UNCALIBRATED until /calibration has enough data.
+Heuristic momentum/regime/jump model with a bounded book adjustment and proxy-basis uncertainty; scores UNCALIBRATED until /calibration has enough data.
 Free spot is a PROXY, not exact Pyth index. No profitability or accuracy guarantee.
 Kalshi published yes/no is sole source of official paper-trade settlement.
-Approximate horizon: expected_expiration_time, close_time, then expiration_time.
+The code currently prefers expected_expiration_time, then close_time, then expiration_time; validate this against each market's actual contract terms before treating the timestamp as the contractual observation endpoint.
 These are not independently verified contractual observation windows. No averaging,
 rounding or candlestick settlement adapter is implemented. Do not confuse forecast
 with exact index settlement replication.
@@ -168,10 +166,10 @@ Restart/deploy starts warm-up again. Free Render may sleep after 15 minutes with
 incoming requests; not guaranteed continuous 24/7 alerting.
 
 ## Tests actually performed
-python -m unittest -v test_update.py
-71 automated tests passed (53 earlier + 18 new/replaced). Captured output: TEST_RESULTS.txt.
-Coverage added in this update: zero-drift probability and clamping, basis effect, trend not biasing probability, gap tolerance,
-full-lookback gauges, expiry order and implausible expiry, hourly own prediction, settlement recording, unpublished results,
+python -m unittest -v
+79 automated tests passed, including new independent-model, order-book, jump, and boundary-freshness tests. Captured output: TEST_RESULTS.txt.
+Coverage added in this update: regime classification, jump detection, acceleration/momentum, top-five book imbalance and bounded book adjustment,
+full-lookback gauges, expiry order and implausible expiry, hourly own prediction and pinned strike selection, settlement recording and boundary-sample freshness, unpublished results,
 Brier vs Kalshi mid, log failure safety, fee multiplier, min-time alert gate, momentum alerts off, /api/log auth.
 Coverage earlier: explicit selection, independent model/manual sides, switching revocation,
 message/owner binding, no orders on selector taps, duplicate handling, missing asks,
@@ -183,6 +181,6 @@ live Telegram UI, browser rendering or deployment test performed. Nothing deploy
 
 ## Package contents
 bot.py, free_gold.py, trade_controls.py, requirements.txt, env.example,
-test_update.py, forecast_log.py, TEST_RESULTS.txt, changes.diff, README.md, MANIFEST.json.
+test_update.py, test_gold_model.py, gold_model.py, forecast_log.py, TEST_RESULTS.txt, README.md, MANIFEST.json, env.example.
 env.example is a reference, not automatically loaded. No credentials included.
 Manifest provides SHA256/size; ZIP verified for integrity before delivery.

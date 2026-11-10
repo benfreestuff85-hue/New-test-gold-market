@@ -1,42 +1,50 @@
 {
-  "bot.py": {
-    "bytes": 26481,
-    "sha256": "9851a48a6beefd1d9ed0707262f369c3415abdfe2c829f1bf8f2310a7926853c"
+  "README.md": {
+    "bytes": 15158,
+    "sha256": "fbc98e3258d1ca4e97513f53c4805eb693f7191270f294a436503d2c4fa48513"
   },
-  "free_gold.py": {
-    "bytes": 28442,
-    "sha256": "ae489e4fde4d69a02557fd97d0dbcf59b901d5cc8b5126bc7940d4e8a7aca6a5"
+  "TEST_RESULTS.txt": {
+    "bytes": 10503,
+    "sha256": "4ffa7cb802c9614a07f374af8436f5f92a4b75fc7aae5dcaf01c2c1158b85677"
+  },
+  "UPDATE_NOTES.md": {
+    "bytes": 3316,
+    "sha256": "da75cc7d5e0fe6c0207e0e2e8d3645722bc772bef0fdadff24538fd1a0b4be63"
+  },
+  "bot.py": {
+    "bytes": 26995,
+    "sha256": "5950ca8baccfbe02798049ba26b9685edc38dac5d78a62061a3bf697a8a5b61f"
+  },
+  "env.example": {
+    "bytes": 761,
+    "sha256": "a65af0ff26424872b86154ce51a1769d89ce7ec1d8f5820b1eb8a012bf8b2aca"
   },
   "forecast_log.py": {
-    "bytes": 9788,
-    "sha256": "63d05155646ad681e6e1c42ad2adfd88bae3064303f74dbbd48b84c8e5466507"
+    "bytes": 11977,
+    "sha256": "65597dec84e2fb203f9079658099f6831c502e6946990473798cfd2497cd845d"
   },
-  "trade_controls.py": {
-    "bytes": 8747,
-    "sha256": "370c8d8d354f4437c9664095f416a9313b69f4725edbaa44eb71605bdc08a131"
+  "free_gold.py": {
+    "bytes": 30566,
+    "sha256": "13b9f961ab6743d5cc683d40c212a6a85c67a91f0815a8057dcc7ee162daacef"
+  },
+  "gold_model.py": {
+    "bytes": 6450,
+    "sha256": "09ebaa9bba461fa65e5ed803653dff31f0caeb5301d32ab456ff3e3018540450"
   },
   "requirements.txt": {
     "bytes": 34,
     "sha256": "b55c7f0b0e6d9fdb80db4275c98d627866767d3a2dd8a86537d0cead83d1b913"
   },
-  "env.example": {
-    "bytes": 717,
-    "sha256": "73020a7a29f4f258d851308c51c8736790ce114ab24568431408bec42e99de76"
+  "test_gold_model.py": {
+    "bytes": 2041,
+    "sha256": "2aa6a2a8f3971fc8487c08372d9522ed40a2b0b5509950e9d293aa803c6ab734"
   },
   "test_update.py": {
-    "bytes": 29188,
-    "sha256": "d47e47786e38212fd568dd28d84dec533a03af54f1f8c6a3eed9eeee895980ad"
+    "bytes": 30264,
+    "sha256": "fea25e7fe952433082c2bdcdd274e335ccd72457a87cde04bc7c72a3345f6ffa"
   },
-  "TEST_RESULTS.txt": {
-    "bytes": 9612,
-    "sha256": "ca20393c083a1f0114b9a3aa004f6a14250d59d982dc77d670fa50c2b2a97fd3"
-  },
-  "changes.diff": {
-    "bytes": 60928,
-    "sha256": "3f74be2455d284f9857e32f2920e5c36a8e3ba1f2001cf36ea7e55bfb7e02ad4"
-  },
-  "README.md": {
-    "bytes": 14052,
-    "sha256": "8e8cfe514301edd46676a8c0f24217680902215de33034be6b80535580a555fb"
+  "trade_controls.py": {
+    "bytes": 8747,
+    "sha256": "370c8d8d354f4437c9664095f416a9313b69f4725edbaa44eb71605bdc08a131"
   }
 }

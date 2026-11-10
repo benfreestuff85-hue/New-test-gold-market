@@ -214,6 +214,15 @@ class ForecastTests(unittest.IsolatedAsyncioTestCase):
         report=g.report();self.assertEqual(report.count('Model prediction:'),2);self.assertEqual(report.count('Typical move to finish'),2)
         self.assertNotIn('Projected finish',report)
 
+    async def test_hourly_selected_strike_is_pinned_until_contract_ends(self):
+        from free_gold import select_one
+        now=time.time();close=datetime.fromtimestamp(now+1800,timezone.utc).isoformat()
+        a=market('KXGOLDH-A');a.update(series_ticker='KXGOLDH',floor_strike=4000,close_time=close,expiration_time=close)
+        b=market('KXGOLDH-B');b.update(series_ticker='KXGOLDH',floor_strike=4010,close_time=close,expiration_time=close)
+        first=select_one([a,b],'KXGOLDH',now,4000)
+        second=select_one([a,b],'KXGOLDH',now,4010,first['ticker'])
+        self.assertEqual(first['ticker'],second['ticker'])
+
     async def test_probability_zero_drift_and_clamped(self):
         g=GoldMonitor()
         self.assertAlmostEqual(g.probability(4000,4000,'greater',600,.0003),.5,delta=.01)
@@ -227,13 +236,13 @@ class ForecastTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(free_gold,'BASIS_USD',0.01):tight=g.probability(4001,4000,'greater',30,.0001)
         with patch.object(free_gold,'BASIS_USD',2.0):loose=g.probability(4001,4000,'greater',30,.0001)
         self.assertGreater(tight,loose)
-    async def test_trend_does_not_move_probability(self):
+    async def test_trend_feature_moves_probability_with_bounded_drift(self):
         g=GoldMonitor();now=time.time();g.publish_time=g.received=now-1;e=int(g.publish_time//60)*60
         closes=[3990+i*.15 for i in range(70)];g.price=closes[-1]
         st=SimpleNamespace(candles_1m=SimpleNamespace(candles=candles(closes,e)),candles_5m=SimpleNamespace(candles=[]))
         m=g.model(st,15);self.assertGreater(m['momentum'],50)          # strong uptrend shows on the gauge ...
-        p=g.probability(g.price,g.price,'greater',600,m['sigma'])
-        self.assertAlmostEqual(p,.5,delta=.02)                         # ... but never biases the probability
+        p=g.probability(g.price,g.price,'greater',600,m['sigma'],m)
+        self.assertGreater(p,.5)                                      # validated feature path now contributes a bounded drift prior
     async def test_vol_close_to_close_and_gap_tolerant(self):
         closes=[4000*(1+.0002*(-1)**i) for i in range(40)]
         c=candles(closes,1_800_000_000);self.assertAlmostEqual(realized_vol(c,60,60,20),.0004,delta=.0001)
@@ -244,7 +253,7 @@ class ForecastTests(unittest.IsolatedAsyncioTestCase):
         g.price=closes[-1];st=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs),candles_5m=SimpleNamespace(candles=[]))
         m15=g.model(st,15);self.assertIsNotNone(m15);self.assertIsNotNone(m15['momentum'])
         short=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs[-30:]),candles_5m=SimpleNamespace(candles=[]))
-        self.assertIsNotNone(g.model(short,15)['momentum']);self.assertIsNone(g.model(short,60)['momentum'])  # no fake 1h gauge from 30 min
+        self.assertIsNotNone(g.model(short,15)['momentum']);self.assertIsNone(g.model(short,60))  # no fake 1h forecast from 30 min
         self.assertTrue(g.model(st,60)['fallback'])
     async def test_expiry_prefers_close_time_over_latest_expiration(self):
         m=market();m['expiration_time']=stamp(6*3600);m.pop('expected_expiration_time',None)
@@ -271,11 +280,17 @@ class LogTests(unittest.IsolatedAsyncioTestCase):
         return dict(minutes=minutes,ticker=ticker,target=4000.,yes_score=p,seconds_left=left,momentum=10,quotes=dict(yes_bid=bid,yes_ask=ask))
     def mk(self,ticker,end,**kw):
         return dict(ticker=ticker,strike_type='greater',close_time=stamp(0),expected_expiration_time=stamp(0),expiration_time=stamp(0))
+    async def test_settlement_proxy_close_rejects_stale_minute_sample(self):
+        from free_gold import candle_close_at
+        end=int(time.time())
+        self.assertIsNone(candle_close_at([dict(timestamp=end-60,close=4000,last_sample_ts=end-45)],end))
+        self.assertEqual(candle_close_at([dict(timestamp=end-60,close=4000,last_sample_ts=end-5)],end),4000)
+
     async def test_settle_records_official_result_value_and_proxy_basis(self):
         g=GoldMonitor();end=int(time.time()//60)*60-120
         g.log.record(self.mk('KXGOLD15M-X',end),self.row('KXGOLD15M-X'),.0003,4001.,2.,time.time()-400,end)
         # candle ENDING at `end` (timestamp end-60) closes 4001.00; candle ending at end-900 closes 3999.50
-        cs=[dict(timestamp=end-960,open=1,high=1,low=1,close=3999.5),dict(timestamp=end-60,open=1,high=1,low=1,close=4001.0)]
+        cs=[dict(timestamp=end-960,open=1,high=1,low=1,close=3999.5,last_sample_ts=end-901),dict(timestamp=end-60,open=1,high=1,low=1,close=4001.0,last_sample_ts=end-1)]
         bot=SimpleNamespace(KALSHI_BASE_URL='https://x/trade-api/v2',STATE=SimpleNamespace(candles_1m=SimpleNamespace(candles=cs)))
         sess=FakeSession({'/markets/KXGOLD15M-X':{'market':dict(result='yes',expiration_value='4000.40',floor_strike=3999.9)}})
         await g.settle(sess,bot)
